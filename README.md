@@ -12,11 +12,12 @@ decode 真正压下来**。产品接入是附属产物，不是本项目的主�
 |---|---|---|---|
 | **0** | 还有多少 dispatch 可删？ | ✅ 2026-10-19 | **PROCEED**：保守可删 230/1289 节点（17.8%） |
 | **1** | 3 层 full-attention 能否换成 GQA？ | ✅ 2026-10-19 | **PASS**：1289→1233，logits cosine 0.999998 |
-| 2 | 20 层 shared-KV 能否映射到 GQA？ | 未开始 | — |
+| **2** | 20 层 shared-KV 能否映射到 GQA？ | ✅ 2026-10-19 | **PASS**：1233→1078，35/35 层全 GQA |
 | 3 | 浏览器里真的更快吗？ | 未开始 | — |
 
 Gate 0 的完整报告见 [`docs/experiments/2026-10-19-gate0-census.md`](docs/experiments/2026-10-19-gate0-census.md)，
-Gate 1 见 [`docs/experiments/2026-10-19-gate1-manual-fusion.md`](docs/experiments/2026-10-19-gate1-manual-fusion.md)。
+Gate 1 见 [`docs/experiments/2026-10-19-gate1-manual-fusion.md`](docs/experiments/2026-10-19-gate1-manual-fusion.md)，
+Gate 2 见 [`docs/experiments/2026-10-19-gate2-shared-kv.md`](docs/experiments/2026-10-19-gate2-shared-kv.md)。
 
 ## 假设与 kill criterion
 
@@ -86,6 +87,27 @@ layer 14 的 `k_scores_transpose` 被 4 个 shared full 层复用，用一个
 因为 `SimplifiedLayerNormalization` 的 domain 为空。Gate 1 的判定改为
 `validate_graph` + ORT session 创建 + 数值等价。
 
+## Gate 2 结果（摘要）
+
+产物：`models/derived/gemma4-e2b-q4f16-gate2/`（sha256 `10bbfa63…`）。
+
+| 项 | 数值 |
+|---|---:|
+| 节点数 | 1233 → **1078（−155）**；相对原始 1289 是 **−211（−16.4%）** |
+| 层分类 | **35 GQA / 0 manual / 0 shared-KV** |
+| Gate1→Gate2 decode 等价 | cosine **0.99999893**，rmse/std 0.00378，top5 5/5 |
+| Gate1→Gate2 prefill 等价 | cosine **0.99999261**，rmse/std 0.00678，top5 5/5 |
+| 原始→Gate2 累计等价 | cosine **0.99999672**，rmse/std 0.00981，top5 5/5 |
+| 投影收益（相对原始） | decode 8.50 → **7.11s（−16.4%）**，端到端 11.30 → **9.91s（−12.3%）** |
+
+关键实现细节：shared 层没有自己的 KV cache，K/V 来自 layer 13（16 个 sliding 层）
+或 layer 14（4 个 full 层）。融合时把共享 cache 切成 `past` 和 `new` 两段，
+**每个 donor 只切一次**（9 个节点），16/4 个层共用这份切片，每层只加 1 个 GQA。
+
+另一个必须记住的 ORT 行为：**只有声明了可选的 `present_key` / `present_value`
+输出，CPU 端的 GQA kernel 才会读取 `past_key` / `past_value`**。不声明时它会静默
+忽略 past，只算当前 token。shared 层的 present 输出不暴露给图外，但必须在节点上声明。
+
 ## 目录
 
 ```text
@@ -94,6 +116,7 @@ fused-onnx/
 │  ├─ inspect_graph.py      # Census：逐层算子统计、融合候选、可删节点估算
 │  ├─ dispatch_cost.py      # 把 census + 实测基线变成时间投影
 │  ├─ fuse_manual_attention.py  # Gate 1：manual attention → GQA
+│  ├─ fuse_shared_kv.py     # Gate 2：shared-KV → 切分 cache + GQA
 │  ├─ compare_models.py     # CPU ORT 数值等价性检查
 │  └─ tests/                # 合成 ONNX fixture 的单测
 ├─ bench/
@@ -115,6 +138,8 @@ make cost                  # 打印时间投影 + kill criterion
 make gate0                 # 以上三步
 make gate1                 # 生成 Gate 1 artifact
 make gate1-check           # decode + prefill 两组等价性检查
+make gate2                 # 生成 Gate 2 artifact（全部 35 层 GQA）
+make gate2-check           # Gate1→Gate2 + 原始→Gate2 等价性检查
 ```
 
 默认读取 `~/Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX`。
@@ -152,11 +177,12 @@ models/derived/<artifact-id>/
   `past_key_values.{4,9,14}`，把 `attn/manual/*` 换成 GQA，风险最低。
   判定条件是 ORT session 可创建 + CPU 数值等价；浏览器等价性留到 Gate 3。
   产物在 `models/derived/gemma4-e2b-q4f16-gate1/`。
-- **Gate 2 — hard fusion**：20 层 shared-KV。它们没有自己的 KV cache：
-  16 个 sliding 层复用 `present.13.key/value`，4 个 full 层复用 layer 14 的
-  `k_scores_transpose` / `present.14.value`。先用 `/prototype` 回答
-  「GQA 的外部 K/V 输入能不能表达这种语义」，再写融合器。
+- **Gate 2 — shared-KV fusion（已完成）**：20 层 shared-KV。16 个 sliding 层复用
+  `present.13.key/value`，4 个 full 层复用 `present.14.key/value`。把共享 cache 切成
+  `past` + `new`，每个 donor 只切一次，16/4 层共用；每层加 1 个 GQA。
+  判定条件是 CPU 数值等价；产物在 `models/derived/gemma4-e2b-q4f16-gate2/`。
 - **Gate 3 — measure**：同会话交替 A/B，4 轮中位数；同时记录 runtime 版本和 loadavg。
+  还必须先确认浏览器 WebGPU 端的 GQA 也遵守「声明 present 输出才读 past」这个行为。
 
 ## 非目标
 

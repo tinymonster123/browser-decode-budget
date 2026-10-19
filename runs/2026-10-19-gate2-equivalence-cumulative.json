@@ -1,0 +1,62 @@
+{
+  "base": "/Users/fenghanli/Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX/onnx/decoder_model_merged_q4f16.onnx",
+  "fused": "models/derived/gemma4-e2b-q4f16-gate2/onnx/decoder_model_merged_q4f16.onnx",
+  "input": {
+    "sequence": 1,
+    "past": 4,
+    "seed": 1
+  },
+  "logits": {
+    "max_abs": 0.091796875,
+    "mean_abs": 0.030652828514575958,
+    "cosine": 0.9999967217445374,
+    "rmse_over_std": 0.009813590906560421,
+    "top5_overlap": 5,
+    "argmax_base": 236743,
+    "argmax_fused": 236743,
+    "argmax_equal": true,
+    "top2_gap_base": 0.69921875,
+    "top2_gap_fused": 0.6953125
+  },
+  "present_max_abs": {
+    "present.0.key": 0.0,
+    "present.0.value": 0.0,
+    "present.1.key": 0.0,
+    "present.1.value": 0.0,
+    "present.2.key": 0.0,
+    "present.2.value": 0.0,
+    "present.3.key": 0.0,
+    "present.3.value": 0.0,
+    "present.4.key": 0.0,
+    "present.4.value": 0.0,
+    "present.5.key": 0.00048828125,
+    "present.5.value": 0.00390625,
+    "present.6.key": 0.00048828125,
+    "present.6.value": 0.0029296875,
+    "present.7.key": 0.000732421875,
+    "present.7.value": 0.00390625,
+    "present.8.key": 0.000732421875,
+    "present.8.value": 0.0048828125,
+    "present.9.key": 0.000335693359375,
+    "present.9.value": 0.00634765625,
+    "present.10.key": 0.000885009765625,
+    "present.10.value": 0.0078125,
+    "present.11.key": 0.00146484375,
+    "present.11.value": 0.007080078125,
+    "present.12.key": 0.000732421875,
+    "present.12.value": 0.00634765625,
+    "present.13.key": 0.0006103515625,
+    "present.13.value": 0.0078125,
+    "present.14.key": 0.00042724609375,
+    "present.14.value": 0.00390625
+  },
+  "fused_layer_present_max_abs": {
+    "present.4.key": 0.0,
+    "present.4.value": 0.0,
+    "present.9.key": 0.000335693359375,
+    "present.9.value": 0.00634765625,
+    "present.14.key": 0.00042724609375,
+    "present.14.value": 0.00390625
+  },
+  "passes": true
+}
