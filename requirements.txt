@@ -1,0 +1,5 @@
+# Pinned to the versions used for the Gate 0 census (Python 3.14).
+# Bump deliberately and record the change in the experiment log.
+onnx==1.23.2
+numpy==2.5.4
+onnxruntime==1.31.0

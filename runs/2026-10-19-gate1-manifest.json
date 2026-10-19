@@ -1,0 +1,64 @@
+{
+  "id": "gemma4-e2b-q4f16-gate1",
+  "base": {
+    "path": "/Users/fenghanli/Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX/onnx/decoder_model_merged_q4f16.onnx",
+    "decoder_sha256": "73c0f1fe04f9a3a048fb3319c0671b6cf0346bf33a3a8624c853bcffe01c24a4"
+  },
+  "producer": {
+    "kind": "surgery",
+    "tool": "tools/fuse_manual_attention.py",
+    "layers": [
+      4,
+      9,
+      14
+    ]
+  },
+  "dtype": "q4f16",
+  "opset": [
+    [
+      "",
+      21
+    ],
+    [
+      "com.microsoft",
+      1
+    ]
+  ],
+  "files": {
+    "onnx/decoder_model_merged_q4f16.onnx": "2120f3d9efe616e48af0d443515366b87cfb797f9bdc46bf55157ceae26df1dc"
+  },
+  "fusion": {
+    "layers": [
+      {
+        "layer": 4,
+        "removed": 20,
+        "added": 1,
+        "net_saved": 19,
+        "rewired_consumers": 1,
+        "reused_key_transpose": false
+      },
+      {
+        "layer": 9,
+        "removed": 20,
+        "added": 1,
+        "net_saved": 19,
+        "rewired_consumers": 1,
+        "reused_key_transpose": false
+      },
+      {
+        "layer": 14,
+        "removed": 20,
+        "added": 2,
+        "net_saved": 18,
+        "rewired_consumers": 1,
+        "reused_key_transpose": true
+      }
+    ],
+    "total_removed": 60,
+    "total_added": 4,
+    "net_saved": 56
+  },
+  "runtime": {
+    "browser_equivalence": "pending"
+  }
+}
