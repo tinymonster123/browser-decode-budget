@@ -7,10 +7,14 @@ ARTIFACT ?= models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f1
 GATE1 ?= models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f16.onnx
 GATE2 ?= models/derived/gemma4-e2b-q4f16-gate2/onnx/decoder_model_merged_q4f16.onnx
 
-.PHONY: test census cost gate0 gate1 gate1-check gate2 gate2-check bench-prepare bench
+.PHONY: test test-js census cost gate0 gate1 gate1-check gate2 gate2-check bench-prepare bench
 
 test:
 	$(PY) -m unittest discover -s tools/tests -v
+
+# Gate 6: ledger analysis seam. Plain JSON in, plain numbers out — no browser, no GPU.
+test-js:
+	node --test bench/analysis/*.test.mjs
 
 census:
 	$(PY) tools/inspect_graph.py --model "$(DECODER)" --config "$(CONFIG)" --json "$(CENSUS)"

@@ -200,7 +200,8 @@ fused-onnx/
 │  ├─ compare_models.py     # CPU ORT 数值等价性检查
 │  └─ tests/                # 合成 ONNX fixture 的单测
 ├─ bench/
-│  └─ browser/              # Gate 3：交替 A/B；Gate 4：计数 + 单价；Gate 5：逐 pass 计时
+│  ├─ browser/              # Gate 3：交替 A/B；Gate 4：计数 + 单价；Gate 5：逐 pass 计时
+│  └─ analysis/             # Gate 6：ledger → 数字的纯函数 seam（不碰浏览器/GPU）
 ├─ models/                  # gitignored；见 models/README.md
 ├─ runs/                    # 每次实验的 JSON ledger（进 git）
 └─ docs/experiments/        # 实验记录，负结果同样保留
@@ -212,7 +213,8 @@ fused-onnx/
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-make test                  # 单测
+make test                  # Python 单测
+make test-js               # Gate 6 ledger 分析 seam 的单测（Node test runner）
 make census                # 生成 runs/2026-10-19-gate0-census.json
 make cost                  # 打印时间投影 + kill criterion
 make gate0                 # 以上三步
