@@ -6,20 +6,18 @@
 //
 // Env: REPEATS=5 HEADLESS=1 PORT=8125 OUT=...
 
-import { execFileSync } from 'node:child_process';
-import { spawn } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { cpus, loadavg, tmpdir } from 'node:os';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { dispatchSlope, makeLedger } from '../analysis/ledger.mjs';
-
-const require = createRequire(
-  process.env.PLAYWRIGHT_REQUIRE ?? '/Users/fenghanli/Projects/map-tile-lab/package.json',
-);
-const { chromium } = require('playwright');
+import { dispatchSlope } from '../analysis/ledger.mjs';
+import {
+  announceLoad,
+  instrumentPage,
+  launchChrome,
+  startServer,
+  stampLedger,
+  writeLedger,
+} from './runtime.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
@@ -29,26 +27,9 @@ const HEADLESS = process.env.HEADLESS === '1';
 const OUT =
   process.env.OUT ?? join(root, 'runs', '2026-10-19-exp3-dispatch-cost.json');
 
-const load = loadavg().map((value) => Number(value.toFixed(2)));
-console.log(`system load: ${load.join(' / ')} (${cpus().length} cores)`);
+const load = announceLoad();
 
-const server = spawn(process.execPath, [join(here, 'serve.mjs')], {
-  env: { ...process.env, PORT: String(PORT) },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-server.stdout.on('data', (data) => process.stdout.write(`[server] ${data}`));
-server.stderr.on('data', (data) => process.stderr.write(`[server] ${data}`));
-
-async function waitForServer() {
-  for (let i = 0; i < 100; i++) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${PORT}/`);
-      if (res.ok) return;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error('server did not start');
-}
+const server = startServer(PORT);
 
 function fmt(value, digits = 2) {
   if (value == null || !Number.isFinite(value)) return '—';
@@ -56,32 +37,18 @@ function fmt(value, digits = 2) {
 }
 
 try {
-  await waitForServer();
+  await server.ready;
 
-  const userDataDir = mkdtempSync(join(tmpdir(), 'fused-onnx-microbench-'));
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    channel: 'chrome',
+  const context = await launchChrome({
     headless: HEADLESS,
     viewport: { width: 900, height: 700 },
-    args: [
-      '--no-proxy-server',
-      '--enable-unsafe-webgpu',
-      '--disable-background-timer-throttling',
-      '--disable-renderer-backgrounding',
-    ],
+    label: 'fused-onnx-microbench',
   });
 
   let result;
   try {
     const page = await context.newPage();
-    page.setDefaultTimeout(0);
-    await page.exposeFunction('__reportProgress', (message) => console.log(`[page] ${message}`));
-    page.on('pageerror', (error) => console.log('[pageerror]', String(error).slice(0, 300)));
-    page.on('console', (message) => {
-      if (message.type() === 'error' || message.type() === 'warning') {
-        console.log(`[console:${message.type()}]`, message.text().slice(0, 300));
-      }
-    });
+    await instrumentPage(page);
 
     await page.goto(`http://127.0.0.1:${PORT}/gpu-microbench.html`, { waitUntil: 'load' });
     await page.waitForFunction(() => window.__ready === true, { timeout: 30000 });
@@ -170,18 +137,17 @@ try {
     }
   }
 
-  const ledger = makeLedger({
-    commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
-    loadavg: load,
+  const ledger = stampLedger({
+    root,
     config: { repeats: REPEATS, port: PORT, headless: HEADLESS },
+    load,
     result,
     summary,
   });
-  mkdirSync(join(root, 'runs'), { recursive: true });
-  writeFileSync(OUT, JSON.stringify(ledger, null, 2));
+  writeLedger(OUT, ledger);
   console.log(`\nwrote ${OUT}`);
 
   if (result.error) process.exitCode = 1;
 } finally {
-  server.kill('SIGTERM');
+  server.stop();
 }

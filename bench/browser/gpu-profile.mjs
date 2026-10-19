@@ -5,19 +5,17 @@
 //
 // Env: MODELS=base,gate1,gate2 STEPS=4 HEADLESS=1 PORT=8126 OUT=...
 
-import { execFileSync, spawn } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { cpus, loadavg, tmpdir } from 'node:os';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { makeLedger } from '../analysis/ledger.mjs';
-
-const require = createRequire(
-  process.env.PLAYWRIGHT_REQUIRE ?? '/Users/fenghanli/Projects/map-tile-lab/package.json',
-);
-const { chromium } = require('playwright');
+import {
+  announceLoad,
+  instrumentPage,
+  launchChrome,
+  startServer,
+  stampLedger,
+  writeLedger,
+} from './runtime.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
@@ -29,58 +27,19 @@ const OUT = process.env.OUT ?? join(root, 'runs', '2026-10-19-exp4-pass-profile.
 
 const NODES = { base: 1289, gate1: 1233, gate2: 1078 };
 
-const load = loadavg().map((value) => Number(value.toFixed(2)));
-console.log(`system load: ${load.join(' / ')} (${cpus().length} cores)`);
+const load = announceLoad();
 
-const server = spawn(process.execPath, [join(here, 'serve.mjs')], {
-  env: { ...process.env, PORT: String(PORT) },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-server.stdout.on('data', (data) => process.stdout.write(`[server] ${data}`));
-server.stderr.on('data', (data) => process.stderr.write(`[server] ${data}`));
-
-async function waitForServer() {
-  for (let i = 0; i < 100; i++) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${PORT}/`);
-      if (res.ok) return;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error('server did not start');
-}
+const server = startServer(PORT);
 
 async function measure(model) {
-  const userDataDir = mkdtempSync(join(tmpdir(), `fused-onnx-profile-${model}-`));
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    channel: 'chrome',
+  const context = await launchChrome({
     headless: HEADLESS,
-    viewport: { width: 1100, height: 900 },
-    args: [
-      '--no-proxy-server',
-      '--enable-unsafe-webgpu',
-      '--disable-background-timer-throttling',
-      '--disable-renderer-backgrounding',
-    ],
+    label: `fused-onnx-profile-${model}`,
   });
 
   try {
     const page = await context.newPage();
-    page.setDefaultTimeout(0);
-    await page.exposeFunction('__reportProgress', (message) => {
-      console.log(`[${model}] ${message}`);
-    });
-    page.on('pageerror', (error) => console.log('[pageerror]', String(error).slice(0, 300)));
-    page.on('console', (message) => {
-      if (message.type() === 'error' || message.type() === 'warning') {
-        console.log(`[console:${message.type()}]`, message.text().slice(0, 300));
-      }
-    });
-    page.on('requestfailed', (request) => {
-      const error = request.failure()?.errorText;
-      if (error !== 'net::ERR_ABORTED') console.log('[requestfailed]', request.url(), error);
-    });
-    page.on('crash', () => console.log('[page] CRASHED'));
+    await instrumentPage(page, { prefix: model });
 
     await page.goto(`http://127.0.0.1:${PORT}/gpu-profile.html`, { waitUntil: 'load' });
     await page.waitForFunction(() => window.__ready === true, { timeout: 60000 });
@@ -121,7 +80,7 @@ function sparkline(values, width = 48) {
 }
 
 try {
-  await waitForServer();
+  await server.ready;
 
   const results = [];
   for (const model of MODELS) {
@@ -253,19 +212,18 @@ try {
     console.log(`${result.model.padEnd(8)} ${rows.join('  ')}`);
   }
 
-  const ledger = makeLedger({
-    commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
-    loadavg: load,
+  const ledger = stampLedger({
+    root,
     config: { models: MODELS, steps: STEPS, port: PORT, headless: HEADLESS },
+    load,
     nodeCounts: NODES,
     results,
   });
-  mkdirSync(join(root, 'runs'), { recursive: true });
-  writeFileSync(OUT, JSON.stringify(ledger, null, 2));
+  writeLedger(OUT, ledger);
   console.log(`\nwrote ${OUT}`);
 
   for (const failure of checkFailures) console.error(`[check] ${failure}`);
   if (results.some((r) => r.error) || checkFailures.length) process.exitCode = 1;
 } finally {
-  server.kill('SIGTERM');
+  server.stop();
 }

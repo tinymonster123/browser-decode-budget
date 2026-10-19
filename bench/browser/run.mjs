@@ -7,19 +7,17 @@
 // Env:
 //   REPEATS=4 MAX_NEW=64 HEADLESS=1 PORT=8123 MODEL_BASE=... MODEL_GATE2=...
 
-import { execFileSync, spawn } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { cpus, loadavg, tmpdir } from 'node:os';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { makeLedger } from '../analysis/ledger.mjs';
-
-const require = createRequire(
-  process.env.PLAYWRIGHT_REQUIRE ?? '/Users/fenghanli/Projects/map-tile-lab/package.json',
-);
-const { chromium } = require('playwright');
+import {
+  announceLoad,
+  instrumentPage,
+  launchChrome,
+  startServer,
+  stampLedger,
+  writeLedger,
+} from './runtime.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
@@ -35,26 +33,9 @@ const OUT =
   process.env.GATE3_OUT ??
   join(root, 'runs', `2026-10-19-gate3-${A_NAME}-vs-${B_NAME}.json`);
 
-const load = loadavg().map((value) => Number(value.toFixed(2)));
-console.log(`system load: ${load.join(' / ')} (${cpus().length} cores)`);
+const load = announceLoad();
 
-const server = spawn(process.execPath, [join(here, 'serve.mjs')], {
-  env: { ...process.env, PORT: String(PORT) },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-server.stdout.on('data', (data) => process.stdout.write(`[server] ${data}`));
-server.stderr.on('data', (data) => process.stderr.write(`[server] ${data}`));
-
-async function waitForServer() {
-  for (let i = 0; i < 100; i++) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${PORT}/`);
-      if (res.ok) return;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error('server did not start');
-}
+const server = startServer(PORT);
 
 function median(values) {
   if (!values.length) return null;
@@ -91,40 +72,11 @@ function summarize(rounds) {
 
 let context;
 try {
-  await waitForServer();
-  const userDataDir = mkdtempSync(join(tmpdir(), 'fused-onnx-bench-'));
-  context = await chromium.launchPersistentContext(userDataDir, {
-    channel: 'chrome',
-    headless: HEADLESS,
-    viewport: { width: 1100, height: 900 },
-    args: [
-      '--no-proxy-server',
-      '--enable-unsafe-webgpu',
-      '--disable-background-timer-throttling',
-      '--disable-renderer-backgrounding',
-    ],
-  });
+  await server.ready;
+  context = await launchChrome({ headless: HEADLESS, label: 'fused-onnx-bench' });
 
   const page = await context.newPage();
-  page.setDefaultTimeout(0);
-  await page.exposeFunction('__reportProgress', (message) => {
-    console.log(`[page] ${message}`);
-  });
-  page.on('pageerror', (error) => console.log('[pageerror]', String(error).slice(0, 300)));
-  page.on('console', (message) => {
-    if (message.type() === 'error' || message.type() === 'warning') {
-      console.log(`[console:${message.type()}]`, message.text().slice(0, 300));
-    }
-  });
-  page.on('requestfailed', (request) => {
-    const error = request.failure()?.errorText;
-    // transformers.js aborts duplicate in-flight fetches after a cache hit.
-    if (error !== 'net::ERR_ABORTED') console.log('[requestfailed]', request.url(), error);
-  });
-  page.on('response', (response) => {
-    if (response.status() >= 400) console.log('[http]', response.status(), response.url());
-  });
-  page.on('crash', () => console.log('[page] CRASHED'));
+  await instrumentPage(page, { prefix: 'page', onResponse: true });
 
   console.log('opening page…');
   await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'load' });
@@ -182,9 +134,9 @@ try {
     }
   }
 
-  const ledger = makeLedger({
-    commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
-    loadavg: load,
+  const ledger = stampLedger({
+    root,
+    load,
     config: {
       repeats: REPEATS,
       maxNewTokens: MAX_NEW,
@@ -198,12 +150,11 @@ try {
     summary,
     result,
   });
-  mkdirSync(join(root, 'runs'), { recursive: true });
-  writeFileSync(OUT, JSON.stringify(ledger, null, 2));
+  writeLedger(OUT, ledger);
   console.log(`\nwrote ${OUT}`);
 
   if (result.error) process.exitCode = 1;
 } finally {
   await context?.close();
-  server.kill('SIGTERM');
+  server.stop();
 }

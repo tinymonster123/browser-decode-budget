@@ -14,7 +14,7 @@ test:
 
 # Gate 6: ledger analysis seam. Plain JSON in, plain numbers out — no browser, no GPU.
 test-js:
-	node --test bench/analysis/*.test.mjs
+	node --test bench/analysis/*.test.mjs bench/browser/*.test.mjs
 
 census:
 	$(PY) tools/inspect_graph.py --model "$(DECODER)" --config "$(CONFIG)" --json "$(CENSUS)"

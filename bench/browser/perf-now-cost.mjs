@@ -6,29 +6,26 @@
 //
 // Env: OUT=... LEDGER=runs/2026-10-19-exp2-dispatch-count.json
 
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { cpus, loadavg } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { countsRun, timingRun, makeLedger } from '../analysis/ledger.mjs';
-
-const require = createRequire(
-  process.env.PLAYWRIGHT_REQUIRE ?? '/Users/fenghanli/Projects/map-tile-lab/package.json',
-);
-const { chromium } = require('playwright');
+import { countsRun, timingRun } from '../analysis/ledger.mjs';
+import {
+  announceLoad,
+  launchChrome,
+  stampLedger,
+  writeLedger,
+} from './runtime.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
 const LEDGER = process.env.LEDGER ?? join(root, 'runs', '2026-10-19-exp2-dispatch-count.json');
 const OUT = process.env.OUT ?? join(root, 'runs', '2026-10-19-exp2b-timestamp-overhead.json');
 
-const load = loadavg().map((value) => Number(value.toFixed(2)));
-console.log(`system load: ${load.join(' / ')} (${cpus().length} cores)`);
+const load = announceLoad();
 
-const browser = await chromium.launch({ channel: 'chrome', headless: true });
+const browser = await launchChrome({ headless: true, persistent: false });
 const page = await browser.newPage();
 await page.setContent('<html><body>perf-now probe</body></html>');
 
@@ -101,16 +98,15 @@ try {
   arithmetic = { error: String(error) };
 }
 
-const ledger = makeLedger({
-  commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
-  loadavg: load,
+const ledger = stampLedger({
+  root,
   config: { ledger: LEDGER },
+  load,
   costsUs: costs,
   arithmetic,
 });
 
-mkdirSync(join(root, 'runs'), { recursive: true });
-writeFileSync(OUT, JSON.stringify(ledger, null, 2));
+writeLedger(OUT, ledger);
 
 console.log('Chrome cost per operation');
 console.log(`  performance.now() x1     ${costs.now.toFixed(3)} µs`);
