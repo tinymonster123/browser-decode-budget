@@ -14,6 +14,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { dispatchSlope, makeLedger } from '../analysis/ledger.mjs';
+
 const require = createRequire(
   process.env.PLAYWRIGHT_REQUIRE ?? '/Users/fenghanli/Projects/map-tile-lab/package.json',
 );
@@ -113,7 +115,7 @@ try {
       'wall ms'.padStart(10),
       'cpu ms'.padStart(10),
       'gpu ms'.padStart(10),
-      'µs/dispatch'.padStart(13),
+      'µs/dispatch vs 0'.padStart(17),
     ].join(' '),
   );
 
@@ -141,7 +143,7 @@ try {
           fmt(row.wallMs).padStart(10),
           fmt(row.cpuMs).padStart(10),
           fmt(row.gpuMs).padStart(10),
-          fmt(perDispatch, 3).padStart(13),
+          fmt(perDispatch, 3).padStart(17),
         ].join(' '),
       );
     }
@@ -152,24 +154,29 @@ try {
       `(${result.bindGroup?.count} calls × ${REPEATS} repeats)`,
   );
 
-  // Slopes over the largest counts are the most robust estimate.
-  console.log('\nper-dispatch cost at the two largest counts');
-  for (const [mode, rows] of Object.entries(summary)) {
-    const tail = rows.filter((row) => row.count > 0).slice(-2);
-    const parts = tail.map(
-      (row) => `${row.count}: ${fmt(row.usPerDispatch, 3)} µs`,
-    );
-    console.log(`  ${mode.padEnd(10)} ${parts.join('   ')}`);
+  // The slope between the two largest counts is the robust estimate; it comes
+  // from the same analysis seam the decision report uses.
+  console.log('\nslope between the two largest counts');
+  for (const mode of Object.keys(summary)) {
+    try {
+      const slope = dispatchSlope({ result }, { mode });
+      const [first, second] = slope.points;
+      console.log(
+        `  ${mode.padEnd(10)} ${fmt(slope.usPerDispatch, 3)} µs/dispatch ` +
+          `(${first.count}→${second.count})`,
+      );
+    } catch (error) {
+      console.log(`  ${mode.padEnd(10)} — ${error.message}`);
+    }
   }
 
-  const ledger = {
-    timestamp: new Date().toISOString(),
+  const ledger = makeLedger({
     commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
     loadavg: load,
     config: { repeats: REPEATS, port: PORT, headless: HEADLESS },
     result,
     summary,
-  };
+  });
   mkdirSync(join(root, 'runs'), { recursive: true });
   writeFileSync(OUT, JSON.stringify(ledger, null, 2));
   console.log(`\nwrote ${OUT}`);

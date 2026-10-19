@@ -1,4 +1,4 @@
-// The ledger analysis seam for Gate 6.
+// The ledger seam for Gate 6.
 //
 // Plain JSON in, plain numbers out. Nothing here touches a browser, a GPU or
 // a model, so the numbers used for the decision can be re-derived from the
@@ -9,8 +9,11 @@
 //   microbench  { result: { rows: [{ mode, count, wallMs, ... }] } }
 //   count       { nodeCounts: { model: n }, results: [{ model, variants: [{ runs }] }] }
 //   bandwidth   [{ bytes, ms }]   (the probe in ticket #4 will report this array)
+//
+// `makeLedger` is the one constructor for the envelope every driver writes;
+// its timestamp is injectable so tests stay deterministic.
 
-const DISPATCH_COUNTER = 'pass.dispatchWorkgroups';
+export const DISPATCH_COUNTER = 'pass.dispatchWorkgroups';
 const PLATEAU_TOLERANCE = 0.1;
 
 function median(values) {
@@ -112,12 +115,41 @@ function runsOf(result) {
   return result?.variants?.[0]?.runs ?? [];
 }
 
-function requireRun(result, predicate, model, kind) {
-  const run = runsOf(result).find(predicate);
+const RUN_ROLES = {
+  counts: { cpu: false, label: 'counts-only' },
+  timing: { cpu: true, label: 'cpu-timed' },
+};
+
+function requireRun(result, role) {
+  const model = result?.model ?? 'model';
+  const run = runsOf(result).find((candidate) => candidate.cpu === role.cpu);
   if (!run) {
-    throw new Error(`ledger has no ${kind} run for ${model}`);
+    throw new Error(`ledger has no ${role.label} run for ${model}`);
   }
   return run;
+}
+
+// The two run roles every count ledger writes. Callers select by role, never
+// by position, so a missing run cannot silently become the wrong run.
+export function countsRun(result) {
+  return requireRun(result, RUN_ROLES.counts);
+}
+
+export function timingRun(result) {
+  return requireRun(result, RUN_ROLES.timing);
+}
+
+// The envelope every driver writes: when, from which commit, under what load,
+// and with what configuration. Extra payload fields are copied through. This
+// is the seam's only exported constructor; everything else reads.
+export function makeLedger({
+  timestamp = new Date().toISOString(),
+  commit,
+  loadavg,
+  config,
+  ...fields
+}) {
+  return { timestamp, commit, loadavg, config, ...fields };
 }
 
 // Per-model comparison of a count ledger: dispatch and node deltas, the
@@ -138,18 +170,14 @@ export function compareModels(ledger, { pairs = [] } = {}) {
     const resultA = ledger.results.find((result) => result.model === a);
     const resultB = ledger.results.find((result) => result.model === b);
 
-    const countsA = requireRun(resultA, (run) => run.cpu === false, a, 'counts-only')
-      .perToken?.[DISPATCH_COUNTER];
-    const countsB = requireRun(resultB, (run) => run.cpu === false, b, 'counts-only')
-      .perToken?.[DISPATCH_COUNTER];
+    const countsA = countsRun(resultA).perToken?.[DISPATCH_COUNTER];
+    const countsB = countsRun(resultB).perToken?.[DISPATCH_COUNTER];
     if (!Number.isFinite(countsA) || !Number.isFinite(countsB)) {
       throw new Error(`ledger has no "${DISPATCH_COUNTER}" counter for ${a} or ${b}`);
     }
 
-    const msA = requireRun(resultA, (run) => run.cpu === true, a, 'cpu-timed')
-      .decodeMsPerStep;
-    const msB = requireRun(resultB, (run) => run.cpu === true, b, 'cpu-timed')
-      .decodeMsPerStep;
+    const msA = timingRun(resultA).decodeMsPerStep;
+    const msB = timingRun(resultB).decodeMsPerStep;
     if (!Number.isFinite(msA) || !Number.isFinite(msB)) {
       throw new Error(`ledger has no decodeMsPerStep for ${a} or ${b}`);
     }

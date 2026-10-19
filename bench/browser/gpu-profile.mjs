@@ -12,6 +12,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { makeLedger } from '../analysis/ledger.mjs';
+
 const require = createRequire(
   process.env.PLAYWRIGHT_REQUIRE ?? '/Users/fenghanli/Projects/map-tile-lab/package.json',
 );
@@ -127,6 +129,28 @@ try {
     results.push(await measure(model));
   }
 
+  // Harness self-checks become assertions: the timestamp patch must have
+  // taken, every step must have timestamp coverage, and no encoder may have
+  // overflowed its query slots.
+  const checkFailures = results.flatMap((result) => {
+    if (result.error) return [];
+    const failures = [];
+    for (const [name, ok] of Object.entries(result.patchInfo ?? {})) {
+      if (!ok) failures.push(`${result.model}: ${name} patch failed`);
+    }
+    const runs = result.runs ?? [];
+    if (!runs.length) failures.push(`${result.model}: no decode steps`);
+    for (const run of runs) {
+      if (!(run.coverage > 0)) {
+        failures.push(`${result.model} step ${run.step}: no timestamp coverage`);
+      }
+      if (run.overflowEncoders > 0) {
+        failures.push(`${result.model} step ${run.step}: encoder overflow`);
+      }
+    }
+    return failures;
+  });
+
   for (const result of results) {
     if (result.error) {
       console.error(`\n[${result.model}] error: ${result.error}`);
@@ -229,19 +253,19 @@ try {
     console.log(`${result.model.padEnd(8)} ${rows.join('  ')}`);
   }
 
-  const ledger = {
-    timestamp: new Date().toISOString(),
+  const ledger = makeLedger({
     commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
     loadavg: load,
     config: { models: MODELS, steps: STEPS, port: PORT, headless: HEADLESS },
     nodeCounts: NODES,
     results,
-  };
+  });
   mkdirSync(join(root, 'runs'), { recursive: true });
   writeFileSync(OUT, JSON.stringify(ledger, null, 2));
   console.log(`\nwrote ${OUT}`);
 
-  if (results.some((r) => r.error)) process.exitCode = 1;
+  for (const failure of checkFailures) console.error(`[check] ${failure}`);
+  if (results.some((r) => r.error) || checkFailures.length) process.exitCode = 1;
 } finally {
   server.kill('SIGTERM');
 }

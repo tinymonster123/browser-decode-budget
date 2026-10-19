@@ -14,6 +14,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { makeLedger } from '../analysis/ledger.mjs';
+
 const require = createRequire(
   process.env.PLAYWRIGHT_REQUIRE ?? '/Users/fenghanli/Projects/map-tile-lab/package.json',
 );
@@ -180,8 +182,7 @@ try {
     }
   }
 
-  const ledger = {
-    timestamp: new Date().toISOString(),
+  const ledger = makeLedger({
     commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
     loadavg: load,
     config: {
@@ -196,7 +197,7 @@ try {
     },
     summary,
     result,
-  };
+  });
   mkdirSync(join(root, 'runs'), { recursive: true });
   writeFileSync(OUT, JSON.stringify(ledger, null, 2));
   console.log(`\nwrote ${OUT}`);

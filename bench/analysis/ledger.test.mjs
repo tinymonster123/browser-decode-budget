@@ -11,10 +11,27 @@ import {
   bandwidthPlateau,
   utilization,
   compareModels,
+  countsRun,
+  timingRun,
+  makeLedger,
 } from './ledger.mjs';
 
 function row(mode, count, wallMs, gpuMs = wallMs) {
   return { mode, count, wallMs, gpuMs, cpuMs: 0, samples: [] };
+}
+
+function modelResult(model, dispatch, ms) {
+  return {
+    model,
+    variants: [
+      {
+        runs: [
+          { cpu: false, perToken: { 'pass.dispatchWorkgroups': dispatch } },
+          { cpu: true, decodeMsPerStep: ms },
+        ],
+      },
+    ],
+  };
 }
 
 test('dispatch slope: a synthetic linear sweep returns the slope exactly', () => {
@@ -120,33 +137,62 @@ test('utilization: refuses a zero ceiling instead of dividing by it', () => {
   );
 });
 
-test('compareModels: reports the dispatch and time deltas for a pair', () => {
-  const ledger = {
-    nodeCounts: { base: 100, gate2: 50 },
-    results: [
+test('run roles: counts and timing are selected by role, not position', () => {
+  const result = {
+    model: 'base',
+    variants: [
       {
-        model: 'base',
-        variants: [
-          {
-            runs: [
-              { cpu: false, perToken: { 'pass.dispatchWorkgroups': 100 } },
-              { cpu: true, decodeMsPerStep: 10 },
-            ],
-          },
-        ],
-      },
-      {
-        model: 'gate2',
-        variants: [
-          {
-            runs: [
-              { cpu: false, perToken: { 'pass.dispatchWorkgroups': 60 } },
-              { cpu: true, decodeMsPerStep: 8 },
-            ],
-          },
+        runs: [
+          { cpu: true, decodeMsPerStep: 10 },
+          { cpu: false, perToken: { 'pass.dispatchWorkgroups': 100 } },
         ],
       },
     ],
+  };
+
+  assert.equal(countsRun(result).perToken['pass.dispatchWorkgroups'], 100);
+  assert.equal(timingRun(result).decodeMsPerStep, 10);
+  assert.throws(() => countsRun({ model: 'gate2', variants: [{ runs: [] }] }), /counts-only run for gate2/);
+});
+
+test('makeLedger: one envelope shape, payload copied through', () => {
+  const ledger = makeLedger({
+    timestamp: '2026-10-19T00:00:00.000Z',
+    commit: 'abc1234',
+    loadavg: [1, 2, 3],
+    config: { port: 8124 },
+    results: [{ model: 'base' }],
+  });
+
+  assert.deepEqual(ledger, {
+    timestamp: '2026-10-19T00:00:00.000Z',
+    commit: 'abc1234',
+    loadavg: [1, 2, 3],
+    config: { port: 8124 },
+    results: [{ model: 'base' }],
+  });
+});
+
+test('makeLedger: a built ledger feeds the comparison seam', () => {
+  const ledger = makeLedger({
+    timestamp: '2026-10-19T00:00:00.000Z',
+    commit: 'abc1234',
+    loadavg: [1],
+    config: {},
+    nodeCounts: { base: 100, gate2: 50 },
+    results: [modelResult('base', 100, 10), modelResult('gate2', 60, 8)],
+  });
+
+  const [comparison] = compareModels(ledger, { pairs: [['base', 'gate2']] });
+
+  assert.equal(comparison.deltaDispatches, -40);
+  assert.equal(comparison.usPerRemovedDispatch, 50);
+});
+
+test('compareModels: reports the dispatch and time deltas for a pair', () => {
+  const ledger = {
+    nodeCounts: { base: 100, gate2: 50 },
+    results: [modelResult('base', 100, 10), modelResult('gate2', 60, 8)],
   };
 
   const [comparison] = compareModels(ledger, { pairs: [['base', 'gate2']] });

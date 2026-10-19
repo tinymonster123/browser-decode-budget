@@ -6,10 +6,14 @@
 //
 // Env: OUT=... LEDGER=runs/2026-10-19-exp2-dispatch-count.json
 
+import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpus, loadavg } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { countsRun, timingRun, makeLedger } from '../analysis/ledger.mjs';
 
 const require = createRequire(
   process.env.PLAYWRIGHT_REQUIRE ?? '/Users/fenghanli/Projects/map-tile-lab/package.json',
@@ -20,6 +24,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
 const LEDGER = process.env.LEDGER ?? join(root, 'runs', '2026-10-19-exp2-dispatch-count.json');
 const OUT = process.env.OUT ?? join(root, 'runs', '2026-10-19-exp2b-timestamp-overhead.json');
+
+const load = loadavg().map((value) => Number(value.toFixed(2)));
+console.log(`system load: ${load.join(' / ')} (${cpus().length} cores)`);
 
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
 const page = await browser.newPage();
@@ -64,16 +71,13 @@ try {
   const ledger = JSON.parse(readFileSync(LEDGER, 'utf8'));
   const rows = [];
   for (const result of ledger.results) {
-    const variant = result.variants?.[0];
-    if (!variant) continue;
-    const countsRun = variant.runs.find((run) => run.cpu === false);
-    const timedRun = variant.runs.find((run) => run.cpu === true);
-    if (!countsRun || !timedRun) continue;
-    const callsPerToken = Object.values(countsRun.perToken ?? {}).reduce((a, b) => a + b, 0);
+    const counts = countsRun(result);
+    const timed = timingRun(result);
+    const callsPerToken = Object.values(counts.perToken ?? {}).reduce((a, b) => a + b, 0);
     // cpu=true adds: two performance.now() plus one cpuMs dictionary write.
     const perCallUs = costs.twoNow + costs.dictUpdate;
     const predictedMs = (callsPerToken * perCallUs) / 1000;
-    const measuredMs = timedRun.decodeMsPerStep - countsRun.decodeMsPerStep;
+    const measuredMs = timed.decodeMsPerStep - counts.decodeMsPerStep;
     rows.push({
       model: result.model,
       callsPerToken,
@@ -81,8 +85,8 @@ try {
       predictedMs,
       measuredMs,
       errorPct: predictedMs ? (100 * (measuredMs - predictedMs)) / predictedMs : null,
-      relativePct: countsRun.decodeMsPerStep
-        ? (100 * measuredMs) / countsRun.decodeMsPerStep
+      relativePct: counts.decodeMsPerStep
+        ? (100 * measuredMs) / counts.decodeMsPerStep
         : null,
     });
   }
@@ -97,11 +101,13 @@ try {
   arithmetic = { error: String(error) };
 }
 
-const ledger = {
-  timestamp: new Date().toISOString(),
+const ledger = makeLedger({
+  commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
+  loadavg: load,
+  config: { ledger: LEDGER },
   costsUs: costs,
   arithmetic,
-};
+});
 
 mkdirSync(join(root, 'runs'), { recursive: true });
 writeFileSync(OUT, JSON.stringify(ledger, null, 2));

@@ -14,6 +14,14 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+  DISPATCH_COUNTER,
+  compareModels,
+  countsRun,
+  timingRun,
+  makeLedger,
+} from '../analysis/ledger.mjs';
+
 const require = createRequire(
   process.env.PLAYWRIGHT_REQUIRE ?? '/Users/fenghanli/Projects/map-tile-lab/package.json',
 );
@@ -127,6 +135,17 @@ try {
   }
 
   const errors = results.filter((r) => r.error);
+  // Harness self-checks become assertions: a run whose patch did not take, or
+  // that had no WebGPU, cannot be used as a measurement.
+  const checkFailures = results.flatMap((result) => {
+    if (result.error) return [];
+    const failures = [];
+    if (!result.hasWebGpu) failures.push(`${result.model}: WebGPU unavailable`);
+    for (const [name, ok] of Object.entries(result.patched ?? {})) {
+      if (!ok) failures.push(`${result.model}: ${name} patch failed`);
+    }
+    return failures;
+  });
   for (const result of errors) {
     console.error(`\n[${result.model}] error: ${result.error}`);
     if (result.stack) console.error(result.stack);
@@ -149,15 +168,14 @@ try {
 
   for (const result of results) {
     if (result.error) continue;
-    const variant = result.variants[0];
-    // Prefer the counters-only run for counts; use the cpu run for timing.
-    const counts = variant.runs.find((r) => r.cpu === false) ?? variant.runs[0];
-    const timed = variant.runs.find((r) => r.cpu === true) ?? variant.runs[0];
+    // Roles come from the analysis seam, so a missing run is an error.
+    const counts = countsRun(result);
+    const timed = timingRun(result);
     console.log(
       [
         pad(result.model, 8),
         padStart(NODES[result.model] ?? '?', 6),
-        padStart(fmt(pick(counts, 'pass.dispatchWorkgroups'), 1), 9),
+        padStart(fmt(pick(counts, DISPATCH_COUNTER), 1), 9),
         padStart(fmt(pick(counts, 'pass.dispatchWorkgroupsIndirect'), 1), 9),
         padStart(fmt(pick(counts, 'enc.beginComputePass'), 1), 7),
         padStart(fmt(pick(counts, 'queue.submit'), 1), 7),
@@ -182,13 +200,12 @@ try {
   );
   for (const result of results) {
     if (result.error) continue;
-    const variant = result.variants[0];
-    const counts = variant.runs.find((r) => r.cpu === false) ?? variant.runs[0];
+    const counts = countsRun(result);
     const prefill = counts.prefill ?? {};
     console.log(
       [
         pad(result.model, 8),
-        padStart(fmt(prefill['pass.dispatchWorkgroups'], 1), 9),
+        padStart(fmt(prefill[DISPATCH_COUNTER], 1), 9),
         padStart(fmt(prefill['enc.beginComputePass'], 1), 7),
         padStart(fmt(prefill['queue.submit'], 1), 7),
         padStart(fmt(prefill['dev.createBindGroup'], 1), 8),
@@ -201,8 +218,7 @@ try {
   console.log('\nCPU time inside the wrappers, µs per decode token');
   for (const result of results) {
     if (result.error) continue;
-    const variant = result.variants[0];
-    const timed = variant.runs.find((r) => r.cpu === true) ?? variant.runs[0];
+    const timed = timingRun(result);
     const rows = Object.entries(timed.cpuMsPerToken ?? {})
       .sort((a, b) => b[1] - a[1])
       .slice(0, 8)
@@ -210,19 +226,26 @@ try {
     console.log(`${pad(result.model, 8)} ${rows.join('  ') || '—'}`);
   }
 
+  const ledger = makeLedger({
+    commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
+    loadavg: load,
+    config: { models: MODELS, maxNewTokens: MAX_NEW, port: PORT, headless: HEADLESS },
+    nodeCounts: NODES,
+    results,
+  });
+
+  // Write before analysing: a failed comparison must not discard measurements.
+  mkdirSync(join(root, 'runs'), { recursive: true });
+  writeFileSync(OUT, JSON.stringify(ledger, null, 2));
+
   // ---- The part that actually answers "why" -------------------------
   console.log('\nNode reduction vs real dispatch reduction');
-  const byModel = new Map(
-    results.filter((r) => !r.error).map((r) => [
-      r.model,
-      r.variants[0].runs.find((run) => run.cpu === false) ?? r.variants[0].runs[0],
-    ]),
-  );
   const pairs = [
     ['base', 'gate1'],
     ['gate1', 'gate2'],
     ['base', 'gate2'],
   ];
+  const comparisons = compareModels(ledger, { pairs });
   console.log(
     [
       pad('pair', 14),
@@ -232,22 +255,26 @@ try {
       padStart('Δms/token', 11),
     ].join(' '),
   );
-  for (const [a, b] of pairs) {
-    const ra = byModel.get(a);
-    const rb = byModel.get(b);
-    if (!ra || !rb) continue;
-    const dNodes = (NODES[b] ?? 0) - (NODES[a] ?? 0);
-    const dDispatch =
-      pick(rb, 'pass.dispatchWorkgroups') - pick(ra, 'pass.dispatchWorkgroups');
-    const ratio = dDispatch ? dNodes / dDispatch : null;
-    const dMs = rb.decodeMsPerStep - ra.decodeMsPerStep;
+  for (const comparison of comparisons) {
+    if (comparison.error) {
+      console.log(`${pad(`${comparison.a}→${comparison.b}`, 14)} ${comparison.error}`);
+      continue;
+    }
     console.log(
       [
-        pad(`${a}→${b}`, 14),
-        padStart(dNodes, 8),
-        padStart(dDispatch.toFixed(1), 11),
-        padStart(ratio == null ? '—' : ratio.toFixed(2), 14),
-        padStart(`${dMs >= 0 ? '+' : ''}${dMs.toFixed(2)}`, 11),
+        pad(`${comparison.a}→${comparison.b}`, 14),
+        padStart(comparison.deltaNodes ?? '—', 8),
+        padStart(comparison.deltaDispatches.toFixed(1), 11),
+        padStart(
+          comparison.nodeToDispatchRatio == null
+            ? '—'
+            : comparison.nodeToDispatchRatio.toFixed(2),
+          14,
+        ),
+        padStart(
+          `${comparison.deltaMsPerStep >= 0 ? '+' : ''}${comparison.deltaMsPerStep.toFixed(2)}`,
+          11,
+        ),
       ].join(' '),
     );
   }
@@ -257,29 +284,19 @@ try {
   console.log(
     [pad('pair', 14), ...cValues.map((c) => padStart(`${c}µs`, 9))].join(' '),
   );
-  for (const [a, b] of pairs) {
-    const ra = byModel.get(a);
-    const rb = byModel.get(b);
-    if (!ra || !rb) continue;
-    const dDispatch =
-      pick(rb, 'pass.dispatchWorkgroups') - pick(ra, 'pass.dispatchWorkgroups');
-    const cells = cValues.map((c) => padStart(`${(dDispatch * c) / 1000 >= 0 ? '+' : ''}${((dDispatch * c) / 1000).toFixed(2)}ms`, 9));
-    console.log([pad(`${a}→${b}`, 14), ...cells].join(' '));
+  for (const comparison of comparisons) {
+    if (comparison.error) continue;
+    const cells = cValues.map((c) => {
+      const ms = (comparison.deltaDispatches * c) / 1000;
+      return padStart(`${ms >= 0 ? '+' : ''}${ms.toFixed(2)}ms`, 9);
+    });
+    console.log([pad(`${comparison.a}→${comparison.b}`, 14), ...cells].join(' '));
   }
 
-  const ledger = {
-    timestamp: new Date().toISOString(),
-    commit: execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
-    loadavg: load,
-    config: { models: MODELS, maxNewTokens: MAX_NEW, port: PORT, headless: HEADLESS },
-    nodeCounts: NODES,
-    results,
-  };
-  mkdirSync(join(root, 'runs'), { recursive: true });
-  writeFileSync(OUT, JSON.stringify(ledger, null, 2));
+  for (const failure of checkFailures) console.error(`[check] ${failure}`);
   console.log(`\nwrote ${OUT}`);
 
-  if (errors.length) process.exitCode = 1;
+  if (errors.length || checkFailures.length) process.exitCode = 1;
 } finally {
   server.kill('SIGTERM');
 }
