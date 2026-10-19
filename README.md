@@ -171,6 +171,23 @@ rotary 折进 GQA、或换 WebLLM/MLC 运行时。详见 Gate 3 报告。
 
 详见 [`docs/experiments/2026-10-19-gate4-why-node-count-is-not-time.md`](docs/experiments/2026-10-19-gate4-why-node-count-is-not-time.md)。
 
+## Gate 5 结果：GPU 侧逐 pass 时间
+
+给每个 compute pass 加 `timestampWrites`（标准 `timestamp-query`），把一个
+decode step 拆成 208–266 个 GPU 时间段。
+
+- **最贵的 1 个 pass 占 13%**：位置固定在倒数第三个，只有 **1 次 dispatch**，
+  中位数约 **2.6 ms**。图尾确认是 `/lm_head/MatMul`，一个
+  `262144 × 1536` 的 q4 `MatMulNBits`（约 201 MB 权重，≈77 GB/s）。
+- **16–27 个超过 300 µs 的 pass 占 48–67%**，其余 200 多个 pass 合计只占
+  三分之一。
+- 这些重 pass 是每层的 `MatMulNBits` / `SimplifiedLayerNorm`，不是调度。
+
+**LM head 这 2.6 ms 是一次 dispatch，任何减少节点数的方案都碰不到它**，
+而它单独就占 decode 的约 10%。
+
+详见 [`docs/experiments/2026-10-19-gate5-gpu-pass-profile.md`](docs/experiments/2026-10-19-gate5-gpu-pass-profile.md)。
+
 ## 目录
 
 ```text
@@ -183,7 +200,7 @@ fused-onnx/
 │  ├─ compare_models.py     # CPU ORT 数值等价性检查
 │  └─ tests/                # 合成 ONNX fixture 的单测
 ├─ bench/
-│  └─ browser/              # Gate 3：交替 A/B；Gate 4：调用计数 + 单价 microbench
+│  └─ browser/              # Gate 3：交替 A/B；Gate 4：计数 + 单价；Gate 5：逐 pass 计时
 ├─ models/                  # gitignored；见 models/README.md
 ├─ runs/                    # 每次实验的 JSON ledger（进 git）
 └─ docs/experiments/        # 实验记录，负结果同样保留

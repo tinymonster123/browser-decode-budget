@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="data:," />
+    <title>fused-onnx GPU pass profile</title>
+    <style>
+      body {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        margin: 2rem;
+        line-height: 1.5;
+      }
+      #status {
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>fused-onnx GPU pass profile</h1>
+    <div id="status">booting…</div>
+    <script type="importmap">
+      {
+        "imports": {
+          "onnxruntime-web/webgpu": "/vendor/ort-web/ort.webgpu.bundle.min.mjs",
+          "onnxruntime-common": "/vendor/ort-web/onnxruntime-common/index.js"
+        }
+      }
+    </script>
+    <script type="module">
+      import { env, LogLevel, pipeline, TextStreamer } from '/vendor/transformers.web.js';
+
+      const SYSTEM =
+        'You are a professional translator. Translate the text the user sends into ' +
+        'Chinese (Simplified). Reply with only the translation — no explanation, no notes, ' +
+        'no original text, no quotes.';
+
+      const DEFAULT_TEXT =
+        'The end of Dennard scaling meant that shrinking a transistor no longer reduced its ' +
+        'power density. Chipmakers kept the clock flat and spent the transistor budget on ' +
+        'parallelism instead. Four cores became sixteen, then sixty-four, and the software ' +
+        'world slowly discovered that it did not know how to use them.';
+
+      env.allowLocalModels = false;
+      env.allowRemoteModels = true;
+      env.remoteHost = location.origin + '/';
+      env.remotePathTemplate = '{model}/';
+      env.useBrowserCache = false;
+      env.useWasmCache = true;
+      env.logLevel = LogLevel.ERROR;
+      env.backends.onnx.wasm.wasmPaths = {
+        mjs: '/vendor/ort/ort-wasm-simd-threaded.asyncify.mjs',
+        wasm: '/vendor/ort/ort-wasm-simd-threaded.asyncify.wasm',
+      };
+
+      const status = (text) => {
+        document.querySelector('#status').textContent = text;
+        console.log(text);
+        window.__reportProgress?.(text);
+      };
+
+      // ---------------------------------------------------------------
+      // Timestamp instrumentation
+      // ---------------------------------------------------------------
+      // Every compute pass gets a start/end timestamp written by
+      // GPUComputePassEncoder.writeTimestamp(). Before the encoder is
+      // finished the query set is resolved and copied into a mappable
+      // buffer, so one decode token yields a per-pass GPU timeline.
+
+      const MAX_QUERIES = 64; // per encoder; ~3 passes per encoder in practice
+      const WRAPPED = Symbol('fused-onnx.profile.wrapped');
+      const encMeta = new WeakMap();
+      const passMeta = new WeakMap();
+
+      let ortDevice = null;
+      let profileEnabled = false;
+      let passSeq = 0;
+      let records = [];
+      let patchInfo = { pass: false, encoder: false, device: false, featureInjected: false };
+
+      function wrap(proto, name, factory) {
+        if (!proto) return false;
+        let desc;
+        try {
+          desc = Object.getOwnPropertyDescriptor(proto, name);
+        } catch {
+          return false;
+        }
+        if (!desc || typeof desc.value !== 'function') return false;
+        if (desc.value[WRAPPED]) return true;
+        const orig = desc.value;
+        const wrapped = factory(orig);
+        wrapped[WRAPPED] = true;
+        try {
+          Object.defineProperty(proto, name, { ...desc, value: wrapped });
+        } catch {
+          try {
+            proto[name] = wrapped;
+          } catch {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      function patchFrom(device, encoder, pass) {
+        const devProto = Object.getPrototypeOf(device);
+        const encProto = Object.getPrototypeOf(encoder);
+        const passProto = Object.getPrototypeOf(pass);
+
+        patchInfo.device =
+          wrap(devProto, 'createCommandEncoder', (orig) =>
+            function (...args) {
+              const enc = orig.apply(this, args);
+              if (profileEnabled && this === ortDevice) {
+                const qs = this.createQuerySet({ type: 'timestamp', count: MAX_QUERIES });
+                const resolveBuf = this.createBuffer({
+                  size: MAX_QUERIES * 8,
+                  usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+                });
+                const readBuf = this.createBuffer({
+                  size: MAX_QUERIES * 8,
+                  usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+                });
+                const rec = { qs, resolveBuf, readBuf, n: 0, passes: [], overflow: false };
+                encMeta.set(enc, rec);
+                records.push(rec);
+              }
+              return enc;
+            },
+          ) || patchInfo.device;
+
+        patchInfo.encoder =
+          wrap(encProto, 'beginComputePass', (orig) =>
+            function (...args) {
+              const rec = encMeta.get(this);
+              if (!rec) return orig.apply(this, args);
+              if (rec.n + 2 > MAX_QUERIES) {
+                rec.overflow = true;
+                return orig.apply(this, args);
+              }
+              // Timestamps inside a pass need an experimental feature; the
+              // standard path is timestampWrites on the pass descriptor.
+              const slot = rec.n;
+              rec.n += 2;
+              const desc = { ...(args[0] ?? {}) };
+              desc.timestampWrites = {
+                querySet: rec.qs,
+                beginningOfPassWriteIndex: slot,
+                endOfPassWriteIndex: slot + 1,
+              };
+              const pass2 = orig.call(this, desc);
+              const meta = { rec, slot, seq: passSeq++, dispatches: 0, ended: true };
+              passMeta.set(pass2, meta);
+              rec.passes.push(meta);
+              return pass2;
+            },
+          ) || patchInfo.encoder;
+
+        patchInfo.encoder =
+          wrap(encProto, 'finish', (orig) =>
+            function (...args) {
+              const rec = encMeta.get(this);
+              if (rec && rec.n > 0) {
+                this.resolveQuerySet(rec.qs, 0, rec.n, rec.resolveBuf, 0);
+                this.copyBufferToBuffer(rec.resolveBuf, 0, rec.readBuf, 0, rec.n * 8);
+              }
+              return orig.apply(this, args);
+            },
+          ) || patchInfo.encoder;
+
+        patchInfo.pass =
+          wrap(passProto, 'dispatchWorkgroups', (orig) =>
+            function (...args) {
+              const meta = passMeta.get(this);
+              if (meta) meta.dispatches += 1;
+              return orig.apply(this, args);
+            },
+          ) || patchInfo.pass;
+
+        patchInfo.pass =
+          wrap(passProto, 'dispatchWorkgroupsIndirect', (orig) =>
+            function (...args) {
+              const meta = passMeta.get(this);
+              if (meta) meta.dispatches += 1;
+              return orig.apply(this, args);
+            },
+          ) || patchInfo.pass;
+      }
+
+      // Intercept the adapter/device ORT uses: inject timestamp-query and
+      // patch the prototype objects as soon as the device exists.
+      (() => {
+        const gpu = navigator.gpu;
+        if (!gpu || !gpu.requestAdapter) return;
+        const origRequestAdapter = gpu.requestAdapter.bind(gpu);
+        gpu.requestAdapter = async function (...args) {
+          const adapter = await origRequestAdapter(...args);
+          if (!adapter || adapter[WRAPPED]) return adapter;
+          const supportsTimestamp = adapter.features?.has?.('timestamp-query');
+          const origRequestDevice = adapter.requestDevice.bind(adapter);
+          adapter.requestDevice = async function (desc = {}) {
+            let finalDesc = desc;
+            if (supportsTimestamp) {
+              const required = new Set(desc.requiredFeatures ?? []);
+              required.add('timestamp-query');
+              finalDesc = { ...desc, requiredFeatures: [...required] };
+              patchInfo.featureInjected = true;
+            }
+            const device = await origRequestDevice(finalDesc);
+            ortDevice = device;
+            try {
+              const encoder = device.createCommandEncoder();
+              const pass = encoder.beginComputePass();
+              patchFrom(device, encoder, pass);
+              pass.end();
+            } catch (error) {
+              console.warn('[profile] patch failed', error);
+            }
+            return device;
+          };
+          adapter[WRAPPED] = true;
+          return adapter;
+        };
+      })();
+
+      async function ensurePatched() {
+        if (ortDevice) return true;
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) return false;
+        const device = await adapter.requestDevice();
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        patchFrom(device, encoder, pass);
+        pass.end();
+        device.destroy();
+        return true;
+      }
+
+      async function collectSegments() {
+        if (!ortDevice) return [];
+        await ortDevice.queue.onSubmittedWorkDone();
+        const segments = [];
+        let overflow = 0;
+        for (const rec of records) {
+          if (rec.overflow) overflow += 1;
+          if (!rec.n) continue;
+          try {
+            await rec.readBuf.mapAsync(GPUMapMode.READ, 0, rec.n * 8);
+            const view = new BigInt64Array(rec.readBuf.getMappedRange(0, rec.n * 8));
+            for (const meta of rec.passes) {
+              if (!meta.ended) continue;
+              const start = Number(view[meta.slot]);
+              const end = Number(view[meta.slot + 1]);
+              segments.push({
+                seq: meta.seq,
+                startNs: start,
+                endNs: end,
+                us: (end - start) / 1000,
+                dispatches: meta.dispatches,
+              });
+            }
+            rec.readBuf.unmap();
+          } catch (error) {
+            console.warn('[profile] map failed', error);
+          }
+        }
+        segments.sort((a, b) => a.seq - b.seq);
+        segments.overflowEncoders = overflow;
+        return segments;
+      }
+
+      // ---------------------------------------------------------------
+      // Model + generation
+      // ---------------------------------------------------------------
+
+      async function loadModel(id) {
+        status(`loading ${id}…`);
+        const t0 = performance.now();
+        const pipe = await pipeline('text-generation', id, {
+          device: 'webgpu',
+          dtype: 'q4f16',
+          progress_callback: (p) => {
+            if (p.status === 'progress' && p.file) {
+              const pct = p.total ? Math.round((100 * p.loaded) / p.total) : 0;
+              document.querySelector('#status').textContent =
+                `loading ${id}: ${p.file} ${pct}%`;
+            }
+          },
+        });
+        return { pipe, loadMs: Math.round(performance.now() - t0) };
+      }
+
+      async function generate(pipe, maxNewTokens, text, onToken) {
+        const messages = [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: text },
+        ];
+        let tokens = 0;
+        const streamer = new TextStreamer(pipe.tokenizer, {
+          skip_prompt: true,
+          skip_special_tokens: true,
+          token_callback_function: (generated) => {
+            for (let i = 0; i < generated.length; i++) {
+              tokens += 1;
+              onToken?.(tokens);
+            }
+          },
+          callback_function: () => {},
+        });
+        const t0 = performance.now();
+        await pipe(messages, {
+          max_new_tokens: maxNewTokens,
+          do_sample: false,
+          return_full_text: false,
+          streamer,
+        });
+        const totalMs = performance.now() - t0;
+        return { totalMs, tokens };
+      }
+
+      function summarizeStep(segments, step) {
+        if (!segments.length) return null;
+        const us = segments.map((s) => s.us).sort((a, b) => a - b);
+        const sumUs = us.reduce((a, b) => a + b, 0);
+        const start = Math.min(...segments.map((s) => s.startNs));
+        const end = Math.max(...segments.map((s) => s.endNs));
+        const spanUs = (end - start) / 1000;
+        const pct = (p) => us[Math.min(us.length - 1, Math.floor(p * us.length))];
+        return {
+          step,
+          passes: segments.length,
+          totalDispatches: segments.reduce((a, s) => a + s.dispatches, 0),
+          sumUs,
+          spanUs,
+          coverage: spanUs ? sumUs / spanUs : null,
+          medianUs: pct(0.5),
+          p90Us: pct(0.9),
+          maxUs: us[us.length - 1],
+          overflowEncoders: segments.overflowEncoders ?? 0,
+          segments: segments.map((s) => ({
+            seq: s.seq,
+            us: Number(s.us.toFixed(3)),
+            dispatches: s.dispatches,
+          })),
+        };
+      }
+
+      async function profile({
+        model = 'base',
+        text = DEFAULT_TEXT,
+        profileTokens = 4,
+      } = {}) {
+        const result = {
+          userAgent: navigator.userAgent,
+          hasWebGpu: 'gpu' in navigator,
+          model,
+          patchInfo: null,
+          loadMs: null,
+          runs: [],
+          error: null,
+          stack: null,
+        };
+
+        try {
+          const ok = await ensurePatched();
+          if (!ok) throw new Error('WebGPU unavailable: no adapter');
+          result.patchInfo = { ...patchInfo };
+
+          const loaded = await loadModel(model);
+          result.loadMs = loaded.loadMs;
+
+          status(`warmup ${model}…`);
+          profileEnabled = false;
+          await generate(loaded.pipe, 2, text);
+
+          // Profile decode only: profiling switches on after the first token,
+          // so prefill never reaches the encoder wrapper.
+          records = [];
+          passSeq = 0;
+          const stepMarks = [];
+          profileEnabled = false;
+          status(`profiling ${model}: ${profileTokens} decode steps…`);
+          const tokenTimes = [];
+          const run = await generate(loaded.pipe, profileTokens + 1, text, (tokenIndex) => {
+            if (tokenIndex >= 1) profileEnabled = true;
+            stepMarks.push(passSeq);
+            tokenTimes.push(performance.now());
+          });
+          profileEnabled = false;
+
+          const segments = await collectSegments();
+          result.wallMs = run.totalMs;
+          result.tokens = run.tokens;
+          result.stepMarks = stepMarks;
+
+          // stepMarks[k] is the number of passes recorded when token k+1 was
+          // emitted, so step k spans [stepMarks[k], stepMarks[k + 1]).
+          for (let k = 0; k + 1 < stepMarks.length; k++) {
+            const from = stepMarks[k];
+            const to = stepMarks[k + 1];
+            const slice = segments.filter((s) => s.seq >= from && s.seq < to);
+            const summary = summarizeStep(slice, k);
+            if (summary) {
+              // Wall time between consecutive token callbacks: an independent
+              // check on the timestamp unit and on profiling overhead.
+              if (tokenTimes[k] != null && tokenTimes[k + 1] != null) {
+                summary.stepWallMs = tokenTimes[k + 1] - tokenTimes[k];
+              }
+              result.runs.push(summary);
+            }
+          }
+
+          result.patchInfo = { ...patchInfo };
+        } catch (error) {
+          result.error = String(error);
+          result.stack = error?.stack ?? null;
+        }
+
+        profileEnabled = false;
+        status(result.error ? `error: ${result.error}` : 'done');
+        return result;
+      }
+
+      window.__profile = profile;
+      window.__ready = true;
+      status('ready');
+    </script>
+  </body>
+</html>

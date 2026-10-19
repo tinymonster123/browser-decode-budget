@@ -68,3 +68,7 @@ bench-count: bench-prepare
 # Gate 4: measure what one dispatch / pass / submit costs on this machine.
 bench-microbench: bench-prepare
 	node bench/browser/gpu-microbench.mjs
+
+# Gate 5: per-compute-pass GPU timestamps.
+bench-profile: bench-prepare
+	node bench/browser/gpu-profile.mjs
