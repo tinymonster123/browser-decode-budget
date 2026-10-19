@@ -72,3 +72,7 @@ bench-microbench: bench-prepare
 # Gate 5: per-compute-pass GPU timestamps.
 bench-profile: bench-prepare
 	node bench/browser/gpu-profile.mjs
+
+# Gate 4 follow-up: what the cpu-timed pass costs, reconciled against exp 2.
+bench-perf-now:
+	node bench/browser/perf-now-cost.mjs

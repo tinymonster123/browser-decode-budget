@@ -186,6 +186,52 @@ node bench/browser/gpu-microbench.mjs
 - `bench/browser/count.html` / `count.mjs` — 计数 harness
 - `bench/browser/gpu-microbench.html` / `gpu-microbench.mjs` — 单价 microbenchmark
 
+## 测量扰动：`performance.now()` 的 4.7% 从哪来
+
+`cpu=true` 那遍比 `cpu=false` 慢 4.7%（base 28.51 vs 27.23 ms/token）。
+这不是噪声，可以精确算出来。
+
+用 `bench/browser/perf-now-cost.mjs` 在同一个 Chrome 里测（200 万次）：
+
+| 操作 | 每次 |
+|---|---:|
+| `performance.now()` | 0.083 µs |
+| 连续两次 `performance.now()` | 0.168 µs |
+| 字符串键计数 `obj[key] = (obj[key] ?? 0) + 1` | 0.027 µs |
+| 同一操作打在 `Float64Array` 上 | 0.003 µs |
+
+`cpu=true` 相对 `cpu=false` 每次调用多做的事只有两件：两次
+`performance.now()` 和一次 `cpuMs` 字典写入，合计约 0.195 µs。
+
+一个 token 被 wrapper 包住的调用数（base）：
+
+```text
+dispatch 1112 + setPipeline 1112 + setBindGroup 1112
++ writeBuffer 1112 + createBindGroup 1112
++ beginComputePass 266 + pass.end 266
++ submit 86 + finish 86 + createCommandEncoder 86
++ createBuffer 19 + copyBufferToBuffer 19 = 6388
+```
+
+`6388 × 0.195 µs = 1.25 ms`，实测差 1.28 ms，**误差 +3%**。
+
+| model | calls/token | 预测 | 实测 | 误差 | 占 token |
+|---|---:|---:|---:|---:|---:|
+| base | 6388 | 1.25 ms | 1.28 ms | +3% | 4.7% |
+| gate1 | 6205 | 1.21 ms | 1.52 ms | +26% | 5.8% |
+| gate2 | 5804 | 1.13 ms | 0.90 ms | −21% | 3.3% |
+
+gate1 / gate2 的偏差来自单次运行的 ±0.3 ms 抖动；base 的吻合说明模型是对的。
+
+两点结论：
+
+- wrapper 的其余部分（rest args、`apply`、`try/finally`）在两遍里都有，
+  **4.7% 只是时间戳的增量**，不是整个 wrapper 的成本。
+- 这段 CPU 开销直接反映到 wall time，说明 ORT 的编码在 submit 之间部分卡在
+  关键路径上 —— 否则 1.2 ms 的 CPU 会被 GPU 掩盖。
+
+原始数据：`runs/2026-10-19-exp2b-timestamp-overhead.json`。
+
 ## 已知局限
 
 - microbenchmark 的 dispatch 是空载、互相独立的；真实 dispatch 有依赖和实际

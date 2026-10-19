@@ -1,0 +1,44 @@
+{
+  "timestamp": "2026-10-19T14:12:19.454Z",
+  "costsUs": {
+    "now": 0.08310000000149012,
+    "twoNow": 0.16779999999701975,
+    "dictUpdate": 0.027250000000000003,
+    "typedUpdate": 0.0030500000007450583,
+    "iterations": 2000000,
+    "sink": 1898761906.900248
+  },
+  "arithmetic": {
+    "ledger": "/Users/fenghanli/Projects/fused-onnx/runs/2026-10-19-exp2-dispatch-count.json",
+    "rows": [
+      {
+        "model": "base",
+        "callsPerToken": 6388,
+        "perCallUs": 0.19504999999701975,
+        "predictedMs": 1.245979399980962,
+        "measuredMs": 1.2849999964237213,
+        "errorPct": 3.13172083289302,
+        "relativePct": 4.719926524714009
+      },
+      {
+        "model": "gate1",
+        "callsPerToken": 6205,
+        "perCallUs": 0.19504999999701975,
+        "predictedMs": 1.2102852499815075,
+        "measuredMs": 1.5200000032782555,
+        "errorPct": 25.59022786582586,
+        "relativePct": 5.7674065773755485
+      },
+      {
+        "model": "gate2",
+        "callsPerToken": 5804,
+        "perCallUs": 0.19504999999701975,
+        "predictedMs": 1.1320701999827028,
+        "measuredMs": 0.8950000032782555,
+        "errorPct": -20.941298225858215,
+        "relativePct": 3.2795896053777107
+      }
+    ],
+    "medianCallsPerToken": 6205
+  }
+}
