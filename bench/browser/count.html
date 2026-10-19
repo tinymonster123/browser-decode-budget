@@ -28,6 +28,12 @@
     </script>
     <script type="module">
       import { DEFAULT_TEXT, configureEnv, generate, loadModel, status } from './page-session.mjs';
+      import {
+        interceptDevice,
+        prototypesOf,
+        withThrowawayDevice,
+        wrapMethod,
+      } from './webgpu-patch.mjs';
 
       configureEnv();
 
@@ -41,7 +47,6 @@
       // also used to reach the prototypes in case ORT grabbed its adapter
       // during module import.
 
-      const WRAPPED = Symbol('fused-onnx.wrapped');
       const counters = {
         calls: Object.create(null),
         cpuMs: Object.create(null),
@@ -59,37 +64,18 @@
       }
 
       function wrap(proto, name, key = name) {
-        if (!proto) return false;
-        let desc;
-        try {
-          desc = Object.getOwnPropertyDescriptor(proto, name);
-        } catch {
-          return false;
-        }
-        if (!desc || typeof desc.value !== 'function') return false;
-        if (desc.value[WRAPPED]) return true;
-        const orig = desc.value;
-        const wrapped = function (...args) {
-          const t = counters.enabled && counters.cpu ? performance.now() : 0;
-          try {
-            return orig.apply(this, args);
-          } finally {
-            if (counters.enabled) {
-              bump(key, t ? performance.now() - t : 0);
+        return wrapMethod(proto, name, (orig) =>
+          function (...args) {
+            const t = counters.enabled && counters.cpu ? performance.now() : 0;
+            try {
+              return orig.apply(this, args);
+            } finally {
+              if (counters.enabled) {
+                bump(key, t ? performance.now() - t : 0);
+              }
             }
-          }
-        };
-        wrapped[WRAPPED] = true;
-        try {
-          Object.defineProperty(proto, name, { ...desc, value: wrapped });
-        } catch {
-          try {
-            proto[name] = wrapped;
-          } catch {
-            return false;
-          }
-        }
-        return true;
+          },
+        );
       }
 
       const PASS_METHODS = [
@@ -120,66 +106,31 @@
 
       const patched = { pass: false, encoder: false, device: false, queue: false };
 
-      function patchFromObjects(device, encoder, pass) {
-        const passProto = Object.getPrototypeOf(pass);
-        const encProto = Object.getPrototypeOf(encoder);
-        const devProto = Object.getPrototypeOf(device);
-        const queueProto = Object.getPrototypeOf(device.queue);
+      function patchFromObjects(device) {
+        const protos = prototypesOf(device);
 
-        for (const name of PASS_METHODS) patched.pass ||= false;
         let ok = 0;
-        for (const name of PASS_METHODS) ok += wrap(passProto, name, `pass.${name}`) ? 1 : 0;
+        for (const name of PASS_METHODS) ok += wrap(protos.pass, name, `pass.${name}`) ? 1 : 0;
         if (ok) patched.pass = true;
         ok = 0;
-        for (const name of ENCODER_METHODS) ok += wrap(encProto, name, `enc.${name}`) ? 1 : 0;
+        for (const name of ENCODER_METHODS) ok += wrap(protos.encoder, name, `enc.${name}`) ? 1 : 0;
         if (ok) patched.encoder = true;
         ok = 0;
-        for (const name of DEVICE_METHODS) ok += wrap(devProto, name, `dev.${name}`) ? 1 : 0;
+        for (const name of DEVICE_METHODS) ok += wrap(protos.device, name, `dev.${name}`) ? 1 : 0;
         if (ok) patched.device = true;
         ok = 0;
-        for (const name of QUEUE_METHODS) ok += wrap(queueProto, name, `queue.${name}`) ? 1 : 0;
+        for (const name of QUEUE_METHODS) ok += wrap(protos.queue, name, `queue.${name}`) ? 1 : 0;
         if (ok) patched.queue = true;
       }
 
       // 1) Intercept the adapter/device ORT will actually use.
-      (() => {
-        const gpu = navigator.gpu;
-        if (!gpu || !gpu.requestAdapter) return;
-        const origRequestAdapter = gpu.requestAdapter.bind(gpu);
-        gpu.requestAdapter = async function (...args) {
-          const adapter = await origRequestAdapter(...args);
-          if (!adapter || adapter[WRAPPED]) return adapter;
-          const origRequestDevice = adapter.requestDevice.bind(adapter);
-          adapter.requestDevice = async function (...devArgs) {
-            const device = await origRequestDevice(...devArgs);
-            try {
-              const encoder = device.createCommandEncoder();
-              const pass = encoder.beginComputePass();
-              patchFromObjects(device, encoder, pass);
-              pass.end();
-            } catch (error) {
-              console.warn('[count] patch on requestDevice failed', error);
-            }
-            return device;
-          };
-          adapter[WRAPPED] = true;
-          return adapter;
-        };
-      })();
+      interceptDevice({ onDevice: patchFromObjects });
 
       // 2) Also reach the prototypes from a throwaway device. Harmless if
       //    step 1 already patched them (wrappers are idempotent).
       async function patchFromOwnDevice() {
         if (patched.pass && patched.device) return true;
-        const adapter = await navigator.gpu.requestAdapter();
-        if (!adapter) return false;
-        const device = await adapter.requestDevice();
-        const encoder = device.createCommandEncoder();
-        const pass = encoder.beginComputePass();
-        patchFromObjects(device, encoder, pass);
-        pass.end();
-        device.destroy();
-        return true;
+        return withThrowawayDevice(patchFromObjects);
       }
 
       function snapshot() {

@@ -28,6 +28,12 @@
     </script>
     <script type="module">
       import { DEFAULT_TEXT, configureEnv, generate, loadModel, status } from './page-session.mjs';
+      import {
+        interceptDevice,
+        prototypesOf,
+        withThrowawayDevice,
+        wrapMethod,
+      } from './webgpu-patch.mjs';
 
       configureEnv();
 
@@ -40,7 +46,6 @@
       // buffer, so one decode token yields a per-pass GPU timeline.
 
       const MAX_QUERIES = 64; // per encoder; ~3 passes per encoder in practice
-      const WRAPPED = Symbol('fused-onnx.profile.wrapped');
       const encMeta = new WeakMap();
       const passMeta = new WeakMap();
 
@@ -50,38 +55,12 @@
       let records = [];
       let patchInfo = { pass: false, encoder: false, device: false, featureInjected: false };
 
-      function wrap(proto, name, factory) {
-        if (!proto) return false;
-        let desc;
-        try {
-          desc = Object.getOwnPropertyDescriptor(proto, name);
-        } catch {
-          return false;
-        }
-        if (!desc || typeof desc.value !== 'function') return false;
-        if (desc.value[WRAPPED]) return true;
-        const orig = desc.value;
-        const wrapped = factory(orig);
-        wrapped[WRAPPED] = true;
-        try {
-          Object.defineProperty(proto, name, { ...desc, value: wrapped });
-        } catch {
-          try {
-            proto[name] = wrapped;
-          } catch {
-            return false;
-          }
-        }
-        return true;
-      }
-
-      function patchFrom(device, encoder, pass) {
-        const devProto = Object.getPrototypeOf(device);
-        const encProto = Object.getPrototypeOf(encoder);
-        const passProto = Object.getPrototypeOf(pass);
+      function patchFrom(device) {
+        const protos = prototypesOf(device);
+        const wrap = wrapMethod;
 
         patchInfo.device =
-          wrap(devProto, 'createCommandEncoder', (orig) =>
+          wrap(protos.device, 'createCommandEncoder', (orig) =>
             function (...args) {
               const enc = orig.apply(this, args);
               if (profileEnabled && this === ortDevice) {
@@ -103,7 +82,7 @@
           ) || patchInfo.device;
 
         patchInfo.encoder =
-          wrap(encProto, 'beginComputePass', (orig) =>
+          wrap(protos.encoder, 'beginComputePass', (orig) =>
             function (...args) {
               const rec = encMeta.get(this);
               if (!rec) return orig.apply(this, args);
@@ -130,7 +109,7 @@
           ) || patchInfo.encoder;
 
         patchInfo.encoder =
-          wrap(encProto, 'finish', (orig) =>
+          wrap(protos.encoder, 'finish', (orig) =>
             function (...args) {
               const rec = encMeta.get(this);
               if (rec && rec.n > 0) {
@@ -142,7 +121,7 @@
           ) || patchInfo.encoder;
 
         patchInfo.pass =
-          wrap(passProto, 'dispatchWorkgroups', (orig) =>
+          wrap(protos.pass, 'dispatchWorkgroups', (orig) =>
             function (...args) {
               const meta = passMeta.get(this);
               if (meta) meta.dispatches += 1;
@@ -151,7 +130,7 @@
           ) || patchInfo.pass;
 
         patchInfo.pass =
-          wrap(passProto, 'dispatchWorkgroupsIndirect', (orig) =>
+          wrap(protos.pass, 'dispatchWorkgroupsIndirect', (orig) =>
             function (...args) {
               const meta = passMeta.get(this);
               if (meta) meta.dispatches += 1;
@@ -162,51 +141,26 @@
 
       // Intercept the adapter/device ORT uses: inject timestamp-query and
       // patch the prototype objects as soon as the device exists.
-      (() => {
-        const gpu = navigator.gpu;
-        if (!gpu || !gpu.requestAdapter) return;
-        const origRequestAdapter = gpu.requestAdapter.bind(gpu);
-        gpu.requestAdapter = async function (...args) {
-          const adapter = await origRequestAdapter(...args);
-          if (!adapter || adapter[WRAPPED]) return adapter;
-          const supportsTimestamp = adapter.features?.has?.('timestamp-query');
-          const origRequestDevice = adapter.requestDevice.bind(adapter);
-          adapter.requestDevice = async function (desc = {}) {
-            let finalDesc = desc;
-            if (supportsTimestamp) {
-              const required = new Set(desc.requiredFeatures ?? []);
-              required.add('timestamp-query');
-              finalDesc = { ...desc, requiredFeatures: [...required] };
-              patchInfo.featureInjected = true;
-            }
-            const device = await origRequestDevice(finalDesc);
-            ortDevice = device;
-            try {
-              const encoder = device.createCommandEncoder();
-              const pass = encoder.beginComputePass();
-              patchFrom(device, encoder, pass);
-              pass.end();
-            } catch (error) {
-              console.warn('[profile] patch failed', error);
-            }
-            return device;
-          };
-          adapter[WRAPPED] = true;
-          return adapter;
-        };
-      })();
+      interceptDevice({
+        onDevice: (device) => {
+          ortDevice = device;
+          patchFrom(device);
+        },
+        extendDescriptor: (desc, adapter) => {
+          if (!adapter.features?.has?.('timestamp-query')) return desc;
+          const required = new Set(desc.requiredFeatures ?? []);
+          required.add('timestamp-query');
+          patchInfo.featureInjected = true;
+          return { ...desc, requiredFeatures: [...required] };
+        },
+      });
 
       async function ensurePatched() {
         if (ortDevice) return true;
-        const adapter = await navigator.gpu.requestAdapter();
-        if (!adapter) return false;
-        const device = await adapter.requestDevice();
-        const encoder = device.createCommandEncoder();
-        const pass = encoder.beginComputePass();
-        patchFrom(device, encoder, pass);
-        pass.end();
-        device.destroy();
-        return true;
+        return withThrowawayDevice((device) => {
+          ortDevice = device;
+          patchFrom(device);
+        });
       }
 
       async function collectSegments() {
