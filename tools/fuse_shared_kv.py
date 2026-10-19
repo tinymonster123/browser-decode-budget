@@ -24,9 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +32,7 @@ from pathlib import Path
 import onnx
 from onnx import TensorProto, helper
 
+from artifact import write_artifact
 from fuse_manual_attention import (
     ATTENTION_BIAS,
     NUM_HEADS,
@@ -41,7 +40,6 @@ from fuse_manual_attention import (
     SCALE,
     TOTAL_SEQ,
     FusionError,
-    _clone_or_copy,
     _single_output,
     toposort,
     validate_graph,
@@ -79,14 +77,6 @@ GROUPS = (
         window=-1,
     ),
 )
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _add_initializer(model: onnx.ModelProto, name: str, values: list[int]) -> str:
@@ -319,57 +309,6 @@ def fuse_model(model: onnx.ModelProto, layers: list[int]) -> dict:
     }
 
 
-def materialize(
-    model: onnx.ModelProto,
-    model_path: Path,
-    out_dir: Path,
-    force: bool,
-    report: dict,
-) -> Path:
-    if out_dir.exists() and any(out_dir.iterdir()):
-        if not force:
-            raise FusionError(f"{out_dir} is not empty; pass --force to replace")
-        shutil.rmtree(out_dir)
-
-    onnx_dir = out_dir / "onnx"
-    onnx_dir.mkdir(parents=True)
-
-    base_root = model_path.parent.parent
-    for item in base_root.iterdir():
-        if item.name == "onnx":
-            continue
-        _clone_or_copy(item, out_dir / item.name)
-    for item in model_path.parent.iterdir():
-        if item.name == model_path.name:
-            continue
-        _clone_or_copy(item, onnx_dir / item.name)
-
-    out_model = onnx_dir / model_path.name
-    onnx.save(model, out_model)
-
-    manifest = {
-        "id": out_dir.name,
-        "base": {
-            "path": str(model_path),
-            "decoder_sha256": sha256_file(model_path),
-        },
-        "producer": {
-            "kind": "surgery",
-            "tool": "tools/fuse_shared_kv.py",
-            "strategy": "split shared cache into past + new key/value",
-        },
-        "dtype": "q4f16",
-        "opset": [[op.domain or "", op.version] for op in model.opset_import],
-        "files": {f"onnx/{model_path.name}": sha256_file(out_model)},
-        "fusion": report,
-        "runtime": {"browser_equivalence": "pending"},
-    }
-    (out_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False)
-    )
-    return out_model
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
@@ -389,7 +328,15 @@ def main() -> int:
     layers = [int(value) for value in args.layers.split(",") if value.strip()]
     model = onnx.load(str(args.model), load_external_data=False)
     report = fuse_model(model, layers)
-    out_model = materialize(model, args.model, args.out_dir, args.force, report)
+    out_model = write_artifact(
+        model,
+        args.model,
+        args.out_dir,
+        args.force,
+        tool="tools/fuse_shared_kv.py",
+        producer={"strategy": "split shared cache into past + new key/value"},
+        fusion=report,
+    )
 
     print(f"wrote {out_model}")
     print(f"wrote {args.out_dir / 'manifest.json'}")

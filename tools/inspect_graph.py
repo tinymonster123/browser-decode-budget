@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import argparse
 import collections
-import hashlib
 import json
 import re
 import sys
 from pathlib import Path
 
 import onnx
+
+from artifact import sha256_file
 
 LAYER_RE = re.compile(r"/model/layers\.(\d+)/")
 PAST_RE = re.compile(r"^past_key_values\.(\d+)\.(key|value)$")
@@ -58,14 +59,6 @@ def node_label(node: onnx.NodeProto) -> str:
     if node.name:
         return node.name
     return node.output[0] if node.output else "<unnamed>"
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def load_config(path: Path | None) -> dict:

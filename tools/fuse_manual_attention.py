@@ -18,16 +18,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import heapq
 import json
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 import onnx
 from onnx import helper
+
+from artifact import write_artifact
 
 NUM_HEADS = 8
 KV_NUM_HEADS = 1
@@ -40,14 +39,6 @@ ATTENTION_BIAS = "/model/gqa_attention_bias/Expand/output_0"
 
 class FusionError(RuntimeError):
     pass
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def toposort(nodes: list[onnx.NodeProto]) -> list[onnx.NodeProto]:
@@ -274,56 +265,6 @@ def fuse_model(model: onnx.ModelProto, layers: list[int]) -> dict:
     }
 
 
-def _clone_or_copy(source: Path, target: Path) -> None:
-    """APFS copy-on-write clone, falling back to a regular copy.
-
-    The artifact must be self-contained: onnx.checker rejects both symlinks and
-    multi-link hardlinks for external data. `cp -c` gives an independent file
-    without duplicating the 1.5 GB weight file on disk.
-    """
-    result = subprocess.run(
-        ["cp", "-c", str(source), str(target)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if result.returncode != 0:
-        shutil.copy2(source, target)
-
-
-def materialize_artifact(
-    model: onnx.ModelProto,
-    model_path: Path,
-    out_dir: Path,
-    force: bool,
-) -> Path:
-    if out_dir.exists() and any(out_dir.iterdir()):
-        if not force:
-            raise FusionError(f"{out_dir} is not empty; pass --force to replace")
-        shutil.rmtree(out_dir)
-
-    onnx_dir = out_dir / "onnx"
-    onnx_dir.mkdir(parents=True)
-
-    # Symlink everything from the base model directory, except the decoder
-    # which we write ourselves.
-    base_root = model_path.parent.parent
-    for item in base_root.iterdir():
-        target = out_dir / item.name
-        if item.name == "onnx":
-            continue
-        _clone_or_copy(item, target)
-
-    for item in model_path.parent.iterdir():
-        if item.name == model_path.name:
-            continue
-        _clone_or_copy(item, onnx_dir / item.name)
-
-    out_model = onnx_dir / model_path.name
-    onnx.save(model, out_model)
-    return out_model
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
@@ -341,33 +282,19 @@ def main() -> int:
     model = onnx.load(str(args.model), load_external_data=False)
     report = fuse_model(model, layers)
 
-    out_model = materialize_artifact(model, args.model, args.out_dir, args.force)
+    out_model = write_artifact(
+        model,
+        args.model,
+        args.out_dir,
+        args.force,
+        tool="tools/fuse_manual_attention.py",
+        producer={"layers": layers},
+        fusion=report,
+    )
     validate_graph(onnx.load(str(out_model), load_external_data=False))
 
-    manifest = {
-        "id": out_model.parent.parent.name,
-        "base": {
-            "path": str(args.model),
-            "decoder_sha256": sha256_file(args.model),
-        },
-        "producer": {
-            "kind": "surgery",
-            "tool": "tools/fuse_manual_attention.py",
-            "layers": layers,
-        },
-        "dtype": "q4f16",
-        "opset": [[op.domain or "", op.version] for op in model.opset_import],
-        "files": {
-            f"onnx/{args.model.name}": sha256_file(out_model),
-        },
-        "fusion": report,
-        "runtime": {"browser_equivalence": "pending"},
-    }
-    manifest_path = args.out_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
-
     print(f"wrote {out_model}")
-    print(f"wrote {manifest_path}")
+    print(f"wrote {args.out_dir / 'manifest.json'}")
     for item in report["layers"]:
         print(
             f"  layer {item['layer']:>2}: removed {item['removed']:>2}, "
