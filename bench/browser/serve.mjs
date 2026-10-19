@@ -94,6 +94,8 @@ const server = createServer((req, res) => {
   let file = null;
   if (pathname === '/' || pathname === '/index.html') {
     file = join(here, 'index.html');
+  } else if (/^\/[A-Za-z0-9_-]+\.html$/.test(pathname)) {
+    file = safeJoin(here, pathname.slice(1));
   } else if (pathname.startsWith('/vendor/')) {
     file = safeJoin(VENDOR, pathname.slice('/vendor/'.length));
   } else if (pathname.startsWith('/base/')) {

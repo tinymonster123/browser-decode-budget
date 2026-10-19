@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="data:," />
+    <title>fused-onnx dispatch count</title>
+    <style>
+      body {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        margin: 2rem;
+        line-height: 1.5;
+      }
+      #status {
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>fused-onnx dispatch count</h1>
+    <div id="status">booting…</div>
+    <script type="importmap">
+      {
+        "imports": {
+          "onnxruntime-web/webgpu": "/vendor/ort-web/ort.webgpu.bundle.min.mjs",
+          "onnxruntime-common": "/vendor/ort-web/onnxruntime-common/index.js"
+        }
+      }
+    </script>
+    <script type="module">
+      import { env, LogLevel, pipeline, TextStreamer } from '/vendor/transformers.web.js';
+
+      const SYSTEM =
+        'You are a professional translator. Translate the text the user sends into ' +
+        'Chinese (Simplified). Reply with only the translation — no explanation, no notes, ' +
+        'no original text, no quotes.';
+
+      const DEFAULT_TEXT =
+        'The end of Dennard scaling meant that shrinking a transistor no longer reduced its ' +
+        'power density. Chipmakers kept the clock flat and spent the transistor budget on ' +
+        'parallelism instead. Four cores became sixteen, then sixty-four, and the software ' +
+        'world slowly discovered that it did not know how to use them.';
+
+      env.allowLocalModels = false;
+      env.allowRemoteModels = true;
+      env.remoteHost = location.origin + '/';
+      env.remotePathTemplate = '{model}/';
+      env.useBrowserCache = false;
+      env.useWasmCache = true;
+      env.logLevel = LogLevel.ERROR;
+      env.backends.onnx.wasm.wasmPaths = {
+        mjs: '/vendor/ort/ort-wasm-simd-threaded.asyncify.mjs',
+        wasm: '/vendor/ort/ort-wasm-simd-threaded.asyncify.wasm',
+      };
+
+      const status = (text) => {
+        document.querySelector('#status').textContent = text;
+        console.log(text);
+        window.__reportProgress?.(text);
+      };
+
+      // ---------------------------------------------------------------
+      // Counters
+      // ---------------------------------------------------------------
+      // Every call is counted on the object's prototype, so this covers
+      // ORT's internal device even though we never touch it directly.
+      // Patching happens before any model is loaded: the adapter hook is
+      // installed synchronously at module top; a self-created device is
+      // also used to reach the prototypes in case ORT grabbed its adapter
+      // during module import.
+
+      const WRAPPED = Symbol('fused-onnx.wrapped');
+      const counters = {
+        calls: Object.create(null),
+        cpuMs: Object.create(null),
+        cpu: true,
+        enabled: false,
+      };
+
+      function bump(key, dt) {
+        const calls = counters.calls;
+        calls[key] = (calls[key] ?? 0) + 1;
+        if (counters.cpu) {
+          const cpuMs = counters.cpuMs;
+          cpuMs[key] = (cpuMs[key] ?? 0) + dt;
+        }
+      }
+
+      function wrap(proto, name, key = name) {
+        if (!proto) return false;
+        let desc;
+        try {
+          desc = Object.getOwnPropertyDescriptor(proto, name);
+        } catch {
+          return false;
+        }
+        if (!desc || typeof desc.value !== 'function') return false;
+        if (desc.value[WRAPPED]) return true;
+        const orig = desc.value;
+        const wrapped = function (...args) {
+          const t = counters.enabled && counters.cpu ? performance.now() : 0;
+          try {
+            return orig.apply(this, args);
+          } finally {
+            if (counters.enabled) {
+              bump(key, t ? performance.now() - t : 0);
+            }
+          }
+        };
+        wrapped[WRAPPED] = true;
+        try {
+          Object.defineProperty(proto, name, { ...desc, value: wrapped });
+        } catch {
+          try {
+            proto[name] = wrapped;
+          } catch {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      const PASS_METHODS = [
+        'dispatchWorkgroups',
+        'dispatchWorkgroupsIndirect',
+        'setBindGroup',
+        'setPipeline',
+        'end',
+      ];
+      const ENCODER_METHODS = [
+        'beginComputePass',
+        'beginRenderPass',
+        'copyBufferToBuffer',
+        'copyBufferToTexture',
+        'copyTextureToBuffer',
+        'finish',
+      ];
+      const DEVICE_METHODS = [
+        'createCommandEncoder',
+        'createBindGroup',
+        'createBindGroupLayout',
+        'createPipelineLayout',
+        'createComputePipeline',
+        'createShaderModule',
+        'createBuffer',
+      ];
+      const QUEUE_METHODS = ['submit', 'writeBuffer', 'onSubmittedWorkDone'];
+
+      const patched = { pass: false, encoder: false, device: false, queue: false };
+
+      function patchFromObjects(device, encoder, pass) {
+        const passProto = Object.getPrototypeOf(pass);
+        const encProto = Object.getPrototypeOf(encoder);
+        const devProto = Object.getPrototypeOf(device);
+        const queueProto = Object.getPrototypeOf(device.queue);
+
+        for (const name of PASS_METHODS) patched.pass ||= false;
+        let ok = 0;
+        for (const name of PASS_METHODS) ok += wrap(passProto, name, `pass.${name}`) ? 1 : 0;
+        if (ok) patched.pass = true;
+        ok = 0;
+        for (const name of ENCODER_METHODS) ok += wrap(encProto, name, `enc.${name}`) ? 1 : 0;
+        if (ok) patched.encoder = true;
+        ok = 0;
+        for (const name of DEVICE_METHODS) ok += wrap(devProto, name, `dev.${name}`) ? 1 : 0;
+        if (ok) patched.device = true;
+        ok = 0;
+        for (const name of QUEUE_METHODS) ok += wrap(queueProto, name, `queue.${name}`) ? 1 : 0;
+        if (ok) patched.queue = true;
+      }
+
+      // 1) Intercept the adapter/device ORT will actually use.
+      (() => {
+        const gpu = navigator.gpu;
+        if (!gpu || !gpu.requestAdapter) return;
+        const origRequestAdapter = gpu.requestAdapter.bind(gpu);
+        gpu.requestAdapter = async function (...args) {
+          const adapter = await origRequestAdapter(...args);
+          if (!adapter || adapter[WRAPPED]) return adapter;
+          const origRequestDevice = adapter.requestDevice.bind(adapter);
+          adapter.requestDevice = async function (...devArgs) {
+            const device = await origRequestDevice(...devArgs);
+            try {
+              const encoder = device.createCommandEncoder();
+              const pass = encoder.beginComputePass();
+              patchFromObjects(device, encoder, pass);
+              pass.end();
+            } catch (error) {
+              console.warn('[count] patch on requestDevice failed', error);
+            }
+            return device;
+          };
+          adapter[WRAPPED] = true;
+          return adapter;
+        };
+      })();
+
+      // 2) Also reach the prototypes from a throwaway device. Harmless if
+      //    step 1 already patched them (wrappers are idempotent).
+      async function patchFromOwnDevice() {
+        if (patched.pass && patched.device) return true;
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) return false;
+        const device = await adapter.requestDevice();
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        patchFromObjects(device, encoder, pass);
+        pass.end();
+        device.destroy();
+        return true;
+      }
+
+      function snapshot() {
+        return {
+          t: performance.now(),
+          calls: { ...counters.calls },
+          cpuMs: { ...counters.cpuMs },
+        };
+      }
+
+      function resetCounters() {
+        counters.calls = Object.create(null);
+        counters.cpuMs = Object.create(null);
+      }
+
+      // ---------------------------------------------------------------
+      // Model + generation
+      // ---------------------------------------------------------------
+
+      async function loadModel(id) {
+        status(`loading ${id}…`);
+        const t0 = performance.now();
+        const pipe = await pipeline('text-generation', id, {
+          device: 'webgpu',
+          dtype: 'q4f16',
+          progress_callback: (p) => {
+            if (p.status === 'progress' && p.file) {
+              const pct = p.total ? Math.round((100 * p.loaded) / p.total) : 0;
+              document.querySelector('#status').textContent =
+                `loading ${id}: ${p.file} ${pct}%`;
+            }
+          },
+        });
+        return { pipe, loadMs: Math.round(performance.now() - t0) };
+      }
+
+      async function generate(pipe, maxNewTokens, text) {
+        const messages = [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: text },
+        ];
+        const snapshots = [];
+        let tokenCount = 0;
+        const streamer = new TextStreamer(pipe.tokenizer, {
+          skip_prompt: true,
+          skip_special_tokens: true,
+          token_callback_function: (generated) => {
+            for (let i = 0; i < generated.length; i++) {
+              tokenCount += 1;
+              snapshots.push({ tokenIndex: tokenCount, ...snapshot() });
+            }
+          },
+          callback_function: () => {},
+        });
+        const t0 = performance.now();
+        await pipe(messages, {
+          max_new_tokens: maxNewTokens,
+          do_sample: false,
+          return_full_text: false,
+          streamer,
+        });
+        const totalMs = performance.now() - t0;
+        return { snapshots, totalMs, tokens: tokenCount };
+      }
+
+      // Convert cumulative snapshots into per-step deltas.
+      //   step 0      = prefill + first token
+      //   step i >= 1 = one decode step (normally exactly one token)
+      function deltas(snapshots) {
+        const out = [];
+        let prev = { t: null, calls: {}, cpuMs: {} };
+        for (const snap of snapshots) {
+          const calls = {};
+          for (const [key, value] of Object.entries(snap.calls)) {
+            const delta = value - (prev.calls[key] ?? 0);
+            if (delta) calls[key] = delta;
+          }
+          const cpuMs = {};
+          for (const [key, value] of Object.entries(snap.cpuMs)) {
+            const delta = value - (prev.cpuMs[key] ?? 0);
+            if (delta) cpuMs[key] = delta;
+          }
+          out.push({
+            tokenIndex: snap.tokenIndex,
+            stepMs: prev.t == null ? snap.t : snap.t - prev.t,
+            calls,
+            cpuMs,
+          });
+          prev = snap;
+        }
+        return out;
+      }
+
+      function median(values) {
+        const clean = values.filter((v) => Number.isFinite(v));
+        if (!clean.length) return null;
+        const sorted = [...clean].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+      }
+
+      function summarizeRun(run) {
+        const steps = deltas(run.snapshots);
+        const decode = steps.slice(1);
+        const keys = new Set();
+        for (const step of decode) for (const key of Object.keys(step.calls)) keys.add(key);
+        const perKey = {};
+        for (const key of keys) {
+          perKey[key] = median(decode.map((step) => step.calls[key] ?? 0));
+        }
+        const cpuKeys = new Set();
+        for (const step of decode) for (const key of Object.keys(step.cpuMs)) cpuKeys.add(key);
+        const cpuPerKey = {};
+        for (const key of cpuKeys) {
+          cpuPerKey[key] = median(decode.map((step) => step.cpuMs[key] ?? 0));
+        }
+        return {
+          tokens: run.tokens,
+          totalMs: run.totalMs,
+          prefill: steps[0]?.calls ?? {},
+          prefillMs: steps[0]?.stepMs ?? null,
+          decodeSteps: decode.length,
+          decodeMsPerStep: median(decode.map((step) => step.stepMs)),
+          perToken: perKey,
+          cpuMsPerToken: cpuPerKey,
+          steps,
+        };
+      }
+
+      async function measureVariant({ model, maxNewTokens, text, runCpu }) {
+        const result = {
+          model,
+          loadMs: null,
+          loadCounters: null,
+          runs: [],
+          patch: { ...patched },
+        };
+
+        resetCounters();
+        counters.enabled = false;
+        const loaded = await loadModel(model);
+        result.loadMs = loaded.loadMs;
+        result.loadCounters = { ...counters.calls };
+
+        status(`warmup ${model}…`);
+        counters.enabled = true;
+        await generate(loaded.pipe, 2, text);
+
+        for (const cpu of runCpu) {
+          resetCounters();
+          counters.cpu = cpu;
+          status(`measuring ${model} cpu=${cpu}…`);
+          const run = await generate(loaded.pipe, maxNewTokens, text);
+          result.runs.push({ cpu, ...summarizeRun(run) });
+        }
+
+        counters.enabled = false;
+        result.patch = { ...patched };
+        // Detect the "inference is not in this realm" case.
+        result.observedCalls = Object.values(result.runs[0]?.perToken ?? {}).reduce(
+          (a, b) => a + b,
+          0,
+        );
+        return result;
+      }
+
+      async function count({
+        model = 'base',
+        maxNewTokens = 32,
+        text = DEFAULT_TEXT,
+        runCpu = [false, true],
+      } = {}) {
+        const result = {
+          userAgent: navigator.userAgent,
+          hasWebGpu: 'gpu' in navigator,
+          model,
+          patched: null,
+          variants: [],
+          error: null,
+          stack: null,
+        };
+
+        try {
+          const ok = await patchFromOwnDevice();
+          if (!ok) throw new Error('WebGPU unavailable: no adapter');
+          counters.enabled = false;
+          resetCounters();
+          result.patched = { ...patched };
+          result.variants.push(await measureVariant({ model, maxNewTokens, text, runCpu }));
+        } catch (error) {
+          result.error = String(error);
+          result.stack = error?.stack ?? null;
+        }
+
+        status(result.error ? `error: ${result.error}` : 'done');
+        return result;
+      }
+
+      window.__count = count;
+      window.__ready = true;
+      status('ready');
+    </script>
+  </body>
+</html>

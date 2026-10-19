@@ -130,6 +130,47 @@ layer 14 的 `k_scores_transpose` 被 4 个 shared full 层复用，用一个
 后续可选（超出本轮 kill criterion）：去掉未使用的 present 输出、把 q/k norm +
 rotary 折进 GQA、或换 WebLLM/MLC 运行时。详见 Gate 3 报告。
 
+## Gate 4 结果：为什么节点数没有换成时间
+
+不猜，直接数。两个新 harness 都不做 A/B，单模型单独加载：
+
+- `bench/browser/count.mjs` — 在模型加载前 patch WebGPU 原型，数每个 token
+  真实的 dispatch / pass / submit；
+- `bench/browser/gpu-microbench.mjs` — 用最小 compute shader 测一次
+  dispatch / pass / submit 各多少 µs。
+
+**每个 decode token 的真实调用数（中位数）：**
+
+| model | 图节点 | dispatch | compute pass | submit |
+|---|---:|---:|---:|---:|
+| base | 1289 | 1112 | 266 | 86 |
+| gate1 | 1233 | 1089 | 238 | 84 |
+| gate2 | 1078 | 1019 | 214 | 80 |
+
+**单价（Apple Silicon + Chrome 155 / Metal 3）：**
+
+| 操作 | 成本 |
+|---|---:|
+| 同 pass 内一次 dispatch | 1.32 µs |
+| 一次 pass 边界 | 0.88 µs |
+| 一次 submit | 18.2 µs |
+
+**结论：**
+
+1. **删节点 ≠ 删 dispatch。** 删 211 个节点只删 93 次 dispatch，比例
+   2.27 : 1。节点数把收益高估了 2.3 倍。
+2. **dispatch 本身很便宜。** 1112 次全加起来 1.47 ms，占 27 ms 的 5.4%。
+3. **最贵的启动开销和节点数无关。** 86 次 submit 共 1.57 ms，而删掉 16.4%
+   节点只让 submit 从 86 掉到 80 —— submit 次数由图的切分结构决定。
+4. **Gate 1 和 Gate 2 赢的不是同一样东西。** 用管线单价预测，base→gate1
+   只该省 0.09 ms，实测省 1.31 ms（删掉的是 Softmax/Where 这种真在计算的
+   kernel）；gate1→gate2 预测省 0.19 ms，实测 0.73 ms（dispatch + 内存搬运）。
+
+即使 211 个被删节点每一个都对应一次 dispatch，也只能省约 0.28 ms ≈ 1.0%。
+**10% 的 kill criterion 在这条路线上不可达**，不是实现问题。
+
+详见 [`docs/experiments/2026-10-19-gate4-why-node-count-is-not-time.md`](docs/experiments/2026-10-19-gate4-why-node-count-is-not-time.md)。
+
 ## 目录
 
 ```text
@@ -142,7 +183,7 @@ fused-onnx/
 │  ├─ compare_models.py     # CPU ORT 数值等价性检查
 │  └─ tests/                # 合成 ONNX fixture 的单测
 ├─ bench/
-│  └─ browser/              # Gate 3：独立页面 + 本地模型服务 + 交替 A/B
+│  └─ browser/              # Gate 3：交替 A/B；Gate 4：调用计数 + 单价 microbench
 ├─ models/                  # gitignored；见 models/README.md
 ├─ runs/                    # 每次实验的 JSON ledger（进 git）
 └─ docs/experiments/        # 实验记录，负结果同样保留

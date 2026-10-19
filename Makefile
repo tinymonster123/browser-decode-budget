@@ -60,3 +60,11 @@ bench-prepare:
 
 bench: bench-prepare
 	node bench/browser/run.mjs
+
+# Gate 4: count real WebGPU calls per token (single model, no A/B).
+bench-count: bench-prepare
+	node bench/browser/count.mjs
+
+# Gate 4: measure what one dispatch / pass / submit costs on this machine.
+bench-microbench: bench-prepare
+	node bench/browser/gpu-microbench.mjs
