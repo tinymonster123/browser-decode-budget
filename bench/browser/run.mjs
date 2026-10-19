@@ -10,10 +10,10 @@
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { artifact } from './artifacts.mjs';
 import {
   announceLoad,
-  instrumentPage,
-  launchChrome,
+  openPage,
   startServer,
   stampLedger,
   writeLedger,
@@ -30,8 +30,13 @@ const A_NAME = process.env.A_NAME ?? A_MODEL;
 const B_MODEL = process.env.B_MODEL ?? 'gate2';
 const B_NAME = process.env.B_NAME ?? B_MODEL;
 const OUT =
+  process.env.OUT ??
   process.env.GATE3_OUT ??
   join(root, 'runs', `2026-10-19-gate3-${A_NAME}-vs-${B_NAME}.json`);
+
+// Names must exist in the registry: the server only routes registered roots.
+artifact(A_MODEL);
+artifact(B_MODEL);
 
 const load = announceLoad();
 
@@ -73,20 +78,21 @@ function summarize(rounds) {
 let context;
 try {
   await server.ready;
-  context = await launchChrome({ headless: HEADLESS, label: 'fused-onnx-bench' });
-
-  const page = await context.newPage();
-  await instrumentPage(page, { prefix: 'page', onResponse: true });
 
   console.log('opening page…');
-  await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'load' });
-  try {
-    await page.waitForFunction(() => window.__ready === true, { timeout: 60000 });
-  } catch (error) {
-    console.log('[page] __ready never became true');
-    await page.screenshot({ path: '/tmp/fused-onnx-bench-failed.png', fullPage: true });
-    throw error;
-  }
+  const opened = await openPage({
+    url: `http://127.0.0.1:${PORT}/`,
+    headless: HEADLESS,
+    label: 'fused-onnx-bench',
+    prefix: 'page',
+    onResponse: true,
+    onReadyTimeout: async (page) => {
+      console.log('[page] __ready never became true');
+      await page.screenshot({ path: '/tmp/fused-onnx-bench-failed.png', fullPage: true });
+    },
+  });
+  context = opened.context;
+  const page = opened.page;
   console.log('page ready');
 
   console.log(

@@ -12,8 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dispatchSlope } from '../analysis/ledger.mjs';
 import {
   announceLoad,
-  instrumentPage,
-  launchChrome,
+  openPage,
   startServer,
   stampLedger,
   writeLedger,
@@ -39,25 +38,24 @@ function fmt(value, digits = 2) {
 try {
   await server.ready;
 
-  const context = await launchChrome({
-    headless: HEADLESS,
-    viewport: { width: 900, height: 700 },
-    label: 'fused-onnx-microbench',
-  });
-
+  let context;
   let result;
   try {
-    const page = await context.newPage();
-    await instrumentPage(page);
-
-    await page.goto(`http://127.0.0.1:${PORT}/gpu-microbench.html`, { waitUntil: 'load' });
-    await page.waitForFunction(() => window.__ready === true, { timeout: 30000 });
-    result = await page.evaluate(
+    const opened = await openPage({
+      url: `http://127.0.0.1:${PORT}/gpu-microbench.html`,
+      headless: HEADLESS,
+      viewport: { width: 900, height: 700 },
+      label: 'fused-onnx-microbench',
+      prefix: 'page',
+      readyTimeout: 30000,
+    });
+    context = opened.context;
+    result = await opened.page.evaluate(
       (options) => window.__microbench(options),
       { counts: [0, 100, 500, 1000, 2000], repeats: REPEATS },
     );
   } finally {
-    await context.close();
+    await context?.close();
   }
 
   if (result.error) {

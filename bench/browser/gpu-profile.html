@@ -57,10 +57,9 @@
 
       function patchFrom(device) {
         const protos = prototypesOf(device);
-        const wrap = wrapMethod;
 
         patchInfo.device =
-          wrap(protos.device, 'createCommandEncoder', (orig) =>
+          wrapMethod(protos.device, 'createCommandEncoder', (orig) =>
             function (...args) {
               const enc = orig.apply(this, args);
               if (profileEnabled && this === ortDevice) {
@@ -82,7 +81,7 @@
           ) || patchInfo.device;
 
         patchInfo.encoder =
-          wrap(protos.encoder, 'beginComputePass', (orig) =>
+          wrapMethod(protos.encoder, 'beginComputePass', (orig) =>
             function (...args) {
               const rec = encMeta.get(this);
               if (!rec) return orig.apply(this, args);
@@ -109,7 +108,7 @@
           ) || patchInfo.encoder;
 
         patchInfo.encoder =
-          wrap(protos.encoder, 'finish', (orig) =>
+          wrapMethod(protos.encoder, 'finish', (orig) =>
             function (...args) {
               const rec = encMeta.get(this);
               if (rec && rec.n > 0) {
@@ -121,7 +120,7 @@
           ) || patchInfo.encoder;
 
         patchInfo.pass =
-          wrap(protos.pass, 'dispatchWorkgroups', (orig) =>
+          wrapMethod(protos.pass, 'dispatchWorkgroups', (orig) =>
             function (...args) {
               const meta = passMeta.get(this);
               if (meta) meta.dispatches += 1;
@@ -130,7 +129,7 @@
           ) || patchInfo.pass;
 
         patchInfo.pass =
-          wrap(protos.pass, 'dispatchWorkgroupsIndirect', (orig) =>
+          wrapMethod(protos.pass, 'dispatchWorkgroupsIndirect', (orig) =>
             function (...args) {
               const meta = passMeta.get(this);
               if (meta) meta.dispatches += 1;
@@ -157,10 +156,9 @@
 
       async function ensurePatched() {
         if (ortDevice) return true;
-        return withThrowawayDevice((device) => {
-          ortDevice = device;
-          patchFrom(device);
-        });
+        // The throwaway device is destroyed after patching; it must never be
+        // claimed as the ORT device. Only interceptDevice's onDevice does that.
+        return withThrowawayDevice(patchFrom);
       }
 
       async function collectSegments() {
@@ -195,11 +193,6 @@
         segments.overflowEncoders = overflow;
         return segments;
       }
-
-      // ---------------------------------------------------------------
-      // Model + generation
-      // ---------------------------------------------------------------
-
 
       function summarizeStep(segments, step) {
         if (!segments.length) return null;

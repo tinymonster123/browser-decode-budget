@@ -82,8 +82,8 @@ const CHROME_ARGS = [
   '--disable-renderer-backgrounding',
 ];
 
-// persistent=true gives the run its own profile directory, which is how the
-// model-loading drivers isolate one model per context.
+// Returns a BrowserContext when persistent, a Browser otherwise. The
+// model-loading drivers use persistent; perf-now-cost uses the browser form.
 export async function launchChrome({
   headless = false,
   viewport = { width: 1100, height: 900 },
@@ -126,4 +126,45 @@ export async function instrumentPage(page, { prefix = 'page', onResponse = false
   }
   page.on('crash', () => console.log('[page] CRASHED'));
   return page;
+}
+
+// Open a page, instrument it, navigate and wait for the page's ready flag.
+// Experiments supply the URL and the ready condition; the lifecycle is here.
+export async function openPage({
+  url,
+  headless = false,
+  viewport,
+  label = 'fused-onnx',
+  prefix = label,
+  persistent = true,
+  onResponse = false,
+  ready = () => window.__ready === true,
+  readyTimeout = 60000,
+  onReadyTimeout,
+} = {}) {
+  const context = await launchChrome({ headless, viewport, label, persistent });
+  const page = await context.newPage();
+  await instrumentPage(page, { prefix, onResponse });
+  await page.goto(url, { waitUntil: 'load' });
+  try {
+    await page.waitForFunction(ready, { timeout: readyTimeout });
+  } catch (error) {
+    await onReadyTimeout?.(page, error);
+    throw error;
+  }
+  return { context, page };
+}
+
+// Harness self-checks are assertions: collect one message per failed check,
+// then fail the run with a nonzero exit after the ledger is written.
+export function collectFailures(results, inspect) {
+  return results.flatMap((result) => {
+    if (result.error) return [];
+    return inspect(result).map((message) => `${result.model}: ${message}`);
+  });
+}
+
+export function reportFailures(failures) {
+  for (const failure of failures) console.error(`[check] ${failure}`);
+  return failures.length;
 }

@@ -19,8 +19,9 @@ import {
 import { nodeCounts } from './artifacts.mjs';
 import {
   announceLoad,
-  instrumentPage,
-  launchChrome,
+  collectFailures,
+  openPage,
+  reportFailures,
   startServer,
   stampLedger,
   writeLedger,
@@ -42,18 +43,14 @@ const load = announceLoad();
 const server = startServer(PORT);
 
 async function measure(model) {
-  const context = await launchChrome({
+  const { context, page } = await openPage({
+    url: `http://127.0.0.1:${PORT}/count.html`,
     headless: HEADLESS,
     label: `fused-onnx-count-${model}`,
+    prefix: model,
   });
 
   try {
-    const page = await context.newPage();
-    await instrumentPage(page, { prefix: model });
-
-    await page.goto(`http://127.0.0.1:${PORT}/count.html`, { waitUntil: 'load' });
-    await page.waitForFunction(() => window.__ready === true, { timeout: 60000 });
-
     return await page.evaluate(
       (options) => window.__count(options),
       { model, maxNewTokens: MAX_NEW, runCpu: [false, true] },
@@ -96,12 +93,11 @@ try {
   const errors = results.filter((r) => r.error);
   // Harness self-checks become assertions: a run whose patch did not take, or
   // that had no WebGPU, cannot be used as a measurement.
-  const checkFailures = results.flatMap((result) => {
-    if (result.error) return [];
+  const checkFailures = collectFailures(results, (result) => {
     const failures = [];
-    if (!result.hasWebGpu) failures.push(`${result.model}: WebGPU unavailable`);
+    if (!result.hasWebGpu) failures.push('WebGPU unavailable');
     for (const [name, ok] of Object.entries(result.patched ?? {})) {
-      if (!ok) failures.push(`${result.model}: ${name} patch failed`);
+      if (!ok) failures.push(`${name} patch failed`);
     }
     return failures;
   });
@@ -251,7 +247,7 @@ try {
     console.log([pad(`${comparison.a}→${comparison.b}`, 14), ...cells].join(' '));
   }
 
-  for (const failure of checkFailures) console.error(`[check] ${failure}`);
+  reportFailures(checkFailures);
   console.log(`\nwrote ${OUT}`);
 
   if (errors.length || checkFailures.length) process.exitCode = 1;

@@ -11,8 +11,9 @@ import { fileURLToPath } from 'node:url';
 import { nodeCounts } from './artifacts.mjs';
 import {
   announceLoad,
-  instrumentPage,
-  launchChrome,
+  collectFailures,
+  openPage,
+  reportFailures,
   startServer,
   stampLedger,
   writeLedger,
@@ -33,18 +34,14 @@ const load = announceLoad();
 const server = startServer(PORT);
 
 async function measure(model) {
-  const context = await launchChrome({
+  const { context, page } = await openPage({
+    url: `http://127.0.0.1:${PORT}/gpu-profile.html`,
     headless: HEADLESS,
     label: `fused-onnx-profile-${model}`,
+    prefix: model,
   });
 
   try {
-    const page = await context.newPage();
-    await instrumentPage(page, { prefix: model });
-
-    await page.goto(`http://127.0.0.1:${PORT}/gpu-profile.html`, { waitUntil: 'load' });
-    await page.waitForFunction(() => window.__ready === true, { timeout: 60000 });
-
     return await page.evaluate(
       (options) => window.__profile(options),
       { model, profileTokens: STEPS },
@@ -92,20 +89,19 @@ try {
   // Harness self-checks become assertions: the timestamp patch must have
   // taken, every step must have timestamp coverage, and no encoder may have
   // overflowed its query slots.
-  const checkFailures = results.flatMap((result) => {
-    if (result.error) return [];
+  const checkFailures = collectFailures(results, (result) => {
     const failures = [];
     for (const [name, ok] of Object.entries(result.patchInfo ?? {})) {
-      if (!ok) failures.push(`${result.model}: ${name} patch failed`);
+      if (!ok) failures.push(`${name} patch failed`);
     }
     const runs = result.runs ?? [];
-    if (!runs.length) failures.push(`${result.model}: no decode steps`);
+    if (!runs.length) failures.push('no decode steps');
     for (const run of runs) {
       if (!(run.coverage > 0)) {
-        failures.push(`${result.model} step ${run.step}: no timestamp coverage`);
+        failures.push(`step ${run.step}: no timestamp coverage`);
       }
       if (run.overflowEncoders > 0) {
-        failures.push(`${result.model} step ${run.step}: encoder overflow`);
+        failures.push(`step ${run.step}: encoder overflow`);
       }
     }
     return failures;
@@ -223,7 +219,7 @@ try {
   writeLedger(OUT, ledger);
   console.log(`\nwrote ${OUT}`);
 
-  for (const failure of checkFailures) console.error(`[check] ${failure}`);
+  reportFailures(checkFailures);
   if (results.some((r) => r.error) || checkFailures.length) process.exitCode = 1;
 } finally {
   server.stop();

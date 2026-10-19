@@ -16,7 +16,7 @@ from pathlib import Path
 import onnx
 
 
-class ArtifactError(Exception):
+class ArtifactError(RuntimeError):
     """Raised when an artifact directory cannot be prepared."""
 
 
@@ -75,7 +75,6 @@ def write_artifact(
     tool: str,
     fusion: dict,
     producer: dict | None = None,
-    dtype: str = "q4f16",
 ) -> Path:
     """Write the model and manifest; return the written model path."""
     onnx_dir = _prepare_dir(model_path, out_dir, force)
@@ -93,7 +92,7 @@ def write_artifact(
             "tool": tool,
             **(producer or {}),
         },
-        "dtype": dtype,
+        "dtype": "q4f16",
         "opset": [[op.domain or "", op.version] for op in model.opset_import],
         "files": {f"onnx/{model_path.name}": sha256_file(out_model)},
         "fusion": fusion,

@@ -150,7 +150,7 @@
       // Model + generation
       // ---------------------------------------------------------------
 
-      async function collect(pipe, maxNewTokens, text) {
+      async function collectSnapshots(pipe, maxNewTokens, text) {
         const snapshots = [];
         const { totalMs, tokens } = await generate(
           pipe,
@@ -242,13 +242,13 @@
 
         status(`warmup ${model}…`);
         counters.enabled = true;
-        await collect(loaded.pipe, 2, text);
+        await collectSnapshots(loaded.pipe, 2, text);
 
         for (const cpu of runCpu) {
           resetCounters();
           counters.cpu = cpu;
           status(`measuring ${model} cpu=${cpu}…`);
-          const run = await collect(loaded.pipe, maxNewTokens, text);
+          const run = await collectSnapshots(loaded.pipe, maxNewTokens, text);
           result.runs.push({ cpu, ...summarizeRun(run) });
         }
 
