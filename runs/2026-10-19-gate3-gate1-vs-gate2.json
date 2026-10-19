@@ -1,0 +1,154 @@
+{
+  "timestamp": "2026-10-19T13:42:41.745Z",
+  "commit": "b0a2306",
+  "loadavg": [
+    2.05,
+    1.9,
+    1.82
+  ],
+  "config": {
+    "repeats": 4,
+    "maxNewTokens": 64,
+    "port": 8123,
+    "headless": false,
+    "aModel": "gate1",
+    "aName": "gate1",
+    "bModel": "gate2",
+    "bName": "gate2"
+  },
+  "summary": {
+    "gate1": {
+      "runs": 4,
+      "medianMsPerToken": 29.103174603174605,
+      "medianTotalMs": 2154,
+      "medianTokens": 64,
+      "samplesMsPerToken": [
+        28.079,
+        28.508,
+        30.095,
+        29.698
+      ]
+    },
+    "gate2": {
+      "runs": 4,
+      "medianMsPerToken": 28.365079365079364,
+      "medianTotalMs": 2073.5,
+      "medianTokens": 64,
+      "samplesMsPerToken": [
+        27.794,
+        28.397,
+        28.444,
+        28.333
+      ]
+    }
+  },
+  "result": {
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+    "hasWebGpu": true,
+    "load": {
+      "gate1": 3621,
+      "gate2": 5763
+    },
+    "equivalence": {
+      "exact": false,
+      "aText": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何",
+      "bText": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们",
+      "aName": "gate1",
+      "bName": "gate2",
+      "aTokens": 64,
+      "bTokens": 64
+    },
+    "rounds": [
+      {
+        "round": 0,
+        "name": "gate1",
+        "ms": 2081,
+        "tokens": 64,
+        "firstTokenMs": 312,
+        "lastTokenMs": 2081,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何"
+      },
+      {
+        "round": 0,
+        "name": "gate2",
+        "ms": 2063,
+        "tokens": 64,
+        "firstTokenMs": 312,
+        "lastTokenMs": 2063,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 1,
+        "name": "gate2",
+        "ms": 2070,
+        "tokens": 64,
+        "firstTokenMs": 281,
+        "lastTokenMs": 2070,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 1,
+        "name": "gate1",
+        "ms": 2122,
+        "tokens": 64,
+        "firstTokenMs": 326,
+        "lastTokenMs": 2122,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何"
+      },
+      {
+        "round": 2,
+        "name": "gate1",
+        "ms": 2203,
+        "tokens": 64,
+        "firstTokenMs": 306,
+        "lastTokenMs": 2202,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何"
+      },
+      {
+        "round": 2,
+        "name": "gate2",
+        "ms": 2105,
+        "tokens": 64,
+        "firstTokenMs": 313,
+        "lastTokenMs": 2105,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 3,
+        "name": "gate2",
+        "ms": 2077,
+        "tokens": 64,
+        "firstTokenMs": 292,
+        "lastTokenMs": 2077,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 3,
+        "name": "gate1",
+        "ms": 2186,
+        "tokens": 64,
+        "firstTokenMs": 315,
+        "lastTokenMs": 2186,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何"
+      }
+    ],
+    "device": {
+      "sessionKeys": [
+        "handler",
+        "config"
+      ],
+      "config": {
+        "dtype": "q4f16",
+        "device": "webgpu"
+      },
+      "sessionOptions": null,
+      "handlerKeys": [
+        "sessionId",
+        "inputNames",
+        "outputNames",
+        "inputMetadata",
+        "outputMetadata"
+      ]
+    }
+  }
+}

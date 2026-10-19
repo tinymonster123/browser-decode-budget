@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="data:," />
+    <title>fused-onnx Gate 3 bench</title>
+    <style>
+      body {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        margin: 2rem;
+        line-height: 1.5;
+      }
+      #status {
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>fused-onnx Gate 3</h1>
+    <div id="status">booting…</div>
+    <script type="importmap">
+      {
+        "imports": {
+          "onnxruntime-web/webgpu": "/vendor/ort-web/ort.webgpu.bundle.min.mjs",
+          "onnxruntime-common": "/vendor/ort-web/onnxruntime-common/index.js"
+        }
+      }
+    </script>
+    <script type="module">
+      import { env, LogLevel, pipeline, TextStreamer } from '/vendor/transformers.web.js';
+
+      const SYSTEM =
+        'You are a professional translator. Translate the text the user sends into ' +
+        'Chinese (Simplified). Reply with only the translation — no explanation, no notes, ' +
+        'no original text, no quotes.';
+
+      const DEFAULT_TEXT =
+        'The end of Dennard scaling meant that shrinking a transistor no longer reduced its ' +
+        'power density. Chipmakers kept the clock flat and spent the transistor budget on ' +
+        'parallelism instead. Four cores became sixteen, then sixty-four, and the software ' +
+        'world slowly discovered that it did not know how to use them.';
+
+      env.allowLocalModels = false;
+      env.allowRemoteModels = true;
+      env.remoteHost = location.origin + '/';
+      env.remotePathTemplate = '{model}/';
+      env.useBrowserCache = false;
+      env.useWasmCache = true;
+      env.logLevel = LogLevel.ERROR;
+      env.backends.onnx.wasm.wasmPaths = {
+        mjs: '/vendor/ort/ort-wasm-simd-threaded.asyncify.mjs',
+        wasm: '/vendor/ort/ort-wasm-simd-threaded.asyncify.wasm',
+      };
+
+      const status = (text) => {
+        document.querySelector('#status').textContent = text;
+        console.log(text);
+        window.__reportProgress?.(text);
+      };
+
+      async function loadModel(id) {
+        status(`loading ${id}…`);
+        const t0 = performance.now();
+        const pipe = await pipeline('text-generation', id, {
+          device: 'webgpu',
+          dtype: 'q4f16',
+          progress_callback: (p) => {
+            if (p.status === 'progress' && p.file) {
+              const pct = p.total ? Math.round((100 * p.loaded) / p.total) : 0;
+              document.querySelector('#status').textContent =
+                `loading ${id}: ${p.file} ${pct}%`;
+            }
+          },
+        });
+        return { pipe, loadMs: Math.round(performance.now() - t0) };
+      }
+
+      function bigramSimilarity(a, b) {
+        const grams = (value) => {
+          const text = value.replace(/\s+/g, '');
+          const set = new Set();
+          for (let i = 0; i < text.length - 1; i++) set.add(text.slice(i, i + 2));
+          return set;
+        };
+        const left = grams(a);
+        const right = grams(b);
+        const common = [...left].filter((gram) => right.has(gram)).length;
+        const union = left.size + right.size - common;
+        return {
+          jaccard: union ? common / union : 1,
+          common,
+          aSize: left.size,
+          bSize: right.size,
+        };
+      }
+
+      function generatedText(out) {
+        const value = out?.[0]?.generated_text;
+        if (Array.isArray(value)) {
+          const last = value.at(-1);
+          return typeof last === 'string' ? last : (last?.content ?? JSON.stringify(last));
+        }
+        return value ?? '';
+      }
+
+      async function run(pipe, maxNewTokens, text) {
+        const messages = [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: text },
+        ];
+        let tokens = 0;
+        const times = [];
+        const t0 = performance.now();
+        const streamer = new TextStreamer(pipe.tokenizer, {
+          skip_prompt: true,
+          skip_special_tokens: true,
+          token_callback_function: (generated) => {
+            const now = performance.now();
+            for (let i = 0; i < generated.length; i++) times.push(now);
+            tokens += generated.length;
+          },
+          callback_function: () => {},
+        });
+        const out = await pipe(messages, {
+          max_new_tokens: maxNewTokens,
+          do_sample: false,
+          return_full_text: false,
+          streamer,
+        });
+        const ms = performance.now() - t0;
+        return {
+          ms: Math.round(ms),
+          tokens,
+          firstTokenMs: times.length ? Math.round(times[0] - t0) : null,
+          lastTokenMs: times.length ? Math.round(times.at(-1) - t0) : null,
+          text: generatedText(out),
+        };
+      }
+
+      async function bench({
+        repeats = 4,
+        maxNewTokens = 64,
+        text = DEFAULT_TEXT,
+        aModel = 'base',
+        aName = 'base',
+        bModel = 'gate2',
+        bName = 'gate2',
+      } = {}) {
+        const result = {
+          userAgent: navigator.userAgent,
+          hasWebGpu: 'gpu' in navigator,
+          load: {},
+          equivalence: null,
+          rounds: [],
+        };
+
+        try {
+          const a = await loadModel(aModel);
+          result.load[aName] = a.loadMs;
+          const b = await loadModel(bModel);
+          result.load[bName] = b.loadMs;
+
+          const sessions = a.pipe?.model?.sessions ?? {};
+          const first = Object.values(sessions)[0];
+          result.device = first
+            ? {
+                sessionKeys: Object.keys(first),
+                config: first.config ?? null,
+                sessionOptions: first.sessionOptions ?? null,
+                handlerKeys: first.handler ? Object.keys(first.handler) : [],
+              }
+            : null;
+
+          status('warmup…');
+          await run(a.pipe, 1, text);
+          await run(b.pipe, 1, text);
+
+          status('equivalence…');
+          const eqA = await run(a.pipe, maxNewTokens, text);
+          const eqB = await run(b.pipe, maxNewTokens, text);
+          result.equivalence = {
+            exact: eqA.text === eqB.text,
+            aText: eqA.text,
+            bText: eqB.text,
+            aName,
+            bName,
+            aTokens: eqA.tokens,
+            bTokens: eqB.tokens,
+            similarity: bigramSimilarity(eqA.text, eqB.text),
+          };
+
+          for (let round = 0; round < repeats; round++) {
+            const order =
+              round % 2 === 0
+                ? [
+                    [aName, a],
+                    [bName, b],
+                  ]
+                : [
+                    [bName, b],
+                    [aName, a],
+                  ];
+            for (const [name, model] of order) {
+              status(`round ${round + 1}/${repeats}: ${name}`);
+              const measured = await run(model.pipe, maxNewTokens, text);
+              result.rounds.push({ round, name, ...measured });
+            }
+          }
+        } catch (error) {
+          result.error = String(error);
+          result.stack = error?.stack ?? null;
+        }
+
+        status(result.error ? `error: ${result.error}` : 'done');
+        return result;
+      }
+
+      window.__bench = bench;
+      window.__ready = true;
+      status('ready');
+    </script>
+  </body>
+</html>

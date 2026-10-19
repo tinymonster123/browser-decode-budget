@@ -1,0 +1,194 @@
+{
+  "timestamp": "2026-10-19T13:43:51.779Z",
+  "commit": "b0a2306",
+  "loadavg": [
+    2.42,
+    2.07,
+    1.89
+  ],
+  "config": {
+    "repeats": 6,
+    "maxNewTokens": 64,
+    "port": 8123,
+    "headless": false,
+    "aModel": "base",
+    "aName": "base",
+    "bModel": "gate2",
+    "bName": "gate2"
+  },
+  "summary": {
+    "base": {
+      "runs": 6,
+      "medianMsPerToken": 41.24603174603175,
+      "medianTotalMs": 3067.5,
+      "medianTokens": 64,
+      "samplesMsPerToken": [
+        42.254,
+        39.762,
+        40.238,
+        39.317,
+        45.222,
+        42.746
+      ]
+    },
+    "gate2": {
+      "runs": 6,
+      "medianMsPerToken": 40.46825396825397,
+      "medianTotalMs": 2989.5,
+      "medianTokens": 64,
+      "samplesMsPerToken": [
+        37.698,
+        37.444,
+        39.683,
+        41.254,
+        41.921,
+        41.397
+      ]
+    }
+  },
+  "result": {
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+    "hasWebGpu": true,
+    "load": {
+      "base": 3955,
+      "gate2": 5105
+    },
+    "equivalence": {
+      "exact": false,
+      "aText": "邓纳德缩放的终结意味着缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何使用",
+      "bText": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们",
+      "aName": "base",
+      "bName": "gate2",
+      "aTokens": 64,
+      "bTokens": 64
+    },
+    "rounds": [
+      {
+        "round": 0,
+        "name": "base",
+        "ms": 3274,
+        "tokens": 64,
+        "firstTokenMs": 612,
+        "lastTokenMs": 3274,
+        "text": "邓纳德缩放的终结意味着缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何使用"
+      },
+      {
+        "round": 0,
+        "name": "gate2",
+        "ms": 2824,
+        "tokens": 64,
+        "firstTokenMs": 448,
+        "lastTokenMs": 2823,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 1,
+        "name": "gate2",
+        "ms": 2758,
+        "tokens": 64,
+        "firstTokenMs": 399,
+        "lastTokenMs": 2758,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 1,
+        "name": "base",
+        "ms": 2967,
+        "tokens": 64,
+        "firstTokenMs": 462,
+        "lastTokenMs": 2967,
+        "text": "邓纳德缩放的终结意味着缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何使用"
+      },
+      {
+        "round": 2,
+        "name": "base",
+        "ms": 2954,
+        "tokens": 64,
+        "firstTokenMs": 419,
+        "lastTokenMs": 2954,
+        "text": "邓纳德缩放的终结意味着缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何使用"
+      },
+      {
+        "round": 2,
+        "name": "gate2",
+        "ms": 2946,
+        "tokens": 64,
+        "firstTokenMs": 445,
+        "lastTokenMs": 2945,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 3,
+        "name": "gate2",
+        "ms": 3033,
+        "tokens": 64,
+        "firstTokenMs": 434,
+        "lastTokenMs": 3033,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 3,
+        "name": "base",
+        "ms": 2925,
+        "tokens": 64,
+        "firstTokenMs": 447,
+        "lastTokenMs": 2924,
+        "text": "邓纳德缩放的终结意味着缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何使用"
+      },
+      {
+        "round": 4,
+        "name": "base",
+        "ms": 3317,
+        "tokens": 64,
+        "firstTokenMs": 468,
+        "lastTokenMs": 3317,
+        "text": "邓纳德缩放的终结意味着缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何使用"
+      },
+      {
+        "round": 4,
+        "name": "gate2",
+        "ms": 3130,
+        "tokens": 64,
+        "firstTokenMs": 488,
+        "lastTokenMs": 3129,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 5,
+        "name": "gate2",
+        "ms": 3077,
+        "tokens": 64,
+        "firstTokenMs": 468,
+        "lastTokenMs": 3076,
+        "text": "邓纳德缩放的终结意味着，缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。四核变成了十六核，再变成六十四核，软件界慢慢发现自己不知道如何使用它们"
+      },
+      {
+        "round": 5,
+        "name": "base",
+        "ms": 3168,
+        "tokens": 64,
+        "firstTokenMs": 475,
+        "lastTokenMs": 3168,
+        "text": "邓纳德缩放的终结意味着缩小晶体管不再能降低其功率密度。芯片制造商保持了时钟频率不变，转而将晶体管预算投入到并行性上。核心从四个增加到十六个，再到六十四个，软件界慢慢发现自己不知道如何使用"
+      }
+    ],
+    "device": {
+      "sessionKeys": [
+        "handler",
+        "config"
+      ],
+      "config": {
+        "dtype": "q4f16",
+        "device": "webgpu"
+      },
+      "sessionOptions": null,
+      "handlerKeys": [
+        "sessionId",
+        "inputNames",
+        "outputNames",
+        "inputMetadata",
+        "outputMetadata"
+      ]
+    }
+  }
+}

@@ -9,3 +9,6 @@ models/*
 
 # Raw per-run scratch data. The summarized ledger in runs/*.json stays tracked.
 runs/*.raw.json
+
+# Browser runtime assets copied by bench/browser/prepare.mjs.
+bench/browser/vendor/

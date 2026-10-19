@@ -13,11 +13,12 @@ decode 真正压下来**。产品接入是附属产物，不是本项目的主�
 | **0** | 还有多少 dispatch 可删？ | ✅ 2026-10-19 | **PROCEED**：保守可删 230/1289 节点（17.8%） |
 | **1** | 3 层 full-attention 能否换成 GQA？ | ✅ 2026-10-19 | **PASS**：1289→1233，logits cosine 0.999998 |
 | **2** | 20 层 shared-KV 能否映射到 GQA？ | ✅ 2026-10-19 | **PASS**：1233→1078，35/35 层全 GQA |
-| 3 | 浏览器里真的更快吗？ | 未开始 | — |
+| **3** | 浏览器里真的更快吗？ | ❌ 2026-10-19 | **FAIL**：只快 1.9–3.4%，低于 10% 门槛；按 kill criterion 停止 |
 
 Gate 0 的完整报告见 [`docs/experiments/2026-10-19-gate0-census.md`](docs/experiments/2026-10-19-gate0-census.md)，
 Gate 1 见 [`docs/experiments/2026-10-19-gate1-manual-fusion.md`](docs/experiments/2026-10-19-gate1-manual-fusion.md)，
-Gate 2 见 [`docs/experiments/2026-10-19-gate2-shared-kv.md`](docs/experiments/2026-10-19-gate2-shared-kv.md)。
+Gate 2 见 [`docs/experiments/2026-10-19-gate2-shared-kv.md`](docs/experiments/2026-10-19-gate2-shared-kv.md)，
+Gate 3 见 [`docs/experiments/2026-10-19-gate3-browser.md`](docs/experiments/2026-10-19-gate3-browser.md)。
 
 ## 假设与 kill criterion
 
@@ -108,6 +109,27 @@ layer 14 的 `k_scores_transpose` 被 4 个 shared full 层复用，用一个
 输出，CPU 端的 GQA kernel 才会读取 `past_key` / `past_value`**。不声明时它会静默
 忽略 past，只算当前 token。shared 层的 present 输出不暴露给图外，但必须在节点上声明。
 
+## Gate 3 结果（负结果）
+
+在 Chrome 155 + transformers.js 4.3.1 + WebGPU 下，同一页面加载两个 pipeline，
+交替 A/B，greedy 64 tokens：
+
+| 对比 | decode Δ | 首 token Δ |
+|---|---:|---:|
+| base → gate1 | **−4.3%**（30.46 → 29.14 ms/token） | −5.2% |
+| gate1 → gate2 | **−2.5%**（29.10 → 28.37 ms/token） | −3.5% |
+| base → gate2 | **−1.9 ~ −3.4%** | −4.0% |
+
+- **等价性通过**：译文语义等价，字符 bigram Jaccard 约 0.73；没有崩坏。
+  这也证明 WebGPU 端的 shared-KV GQA 正确读取了 past cache。
+- **计时失败**：1.9–3.4% 远低于 10% 的 kill criterion，项目按规则停止。
+- **节点数不是性能指标**：Gate 1 删 4.3% 节点换来 −4.3%；Gate 2 删 12.6%
+  节点只换来 −2.5%。剩下的 `MatMulNBits` / `SimplifiedLayerNorm` 才是成本大头，
+  shared attention 的节点本来就便宜，而且 runtime 可能已经做了部分融合。
+
+后续可选（超出本轮 kill criterion）：去掉未使用的 present 输出、把 q/k norm +
+rotary 折进 GQA、或换 WebLLM/MLC 运行时。详见 Gate 3 报告。
+
 ## 目录
 
 ```text
@@ -120,7 +142,7 @@ fused-onnx/
 │  ├─ compare_models.py     # CPU ORT 数值等价性检查
 │  └─ tests/                # 合成 ONNX fixture 的单测
 ├─ bench/
-│  └─ browser/              # Gate 3：复用 gemma-translate 的交替 A/B harness
+│  └─ browser/              # Gate 3：独立页面 + 本地模型服务 + 交替 A/B
 ├─ models/                  # gitignored；见 models/README.md
 ├─ runs/                    # 每次实验的 JSON ledger（进 git）
 └─ docs/experiments/        # 实验记录，负结果同样保留
@@ -140,6 +162,8 @@ make gate1                 # 生成 Gate 1 artifact
 make gate1-check           # decode + prefill 两组等价性检查
 make gate2                 # 生成 Gate 2 artifact（全部 35 层 GQA）
 make gate2-check           # Gate1→Gate2 + 原始→Gate2 等价性检查
+make bench-prepare         # 准备浏览器 runtime 资产
+make bench                 # Chrome + WebGPU：默认 base vs gate2
 ```
 
 默认读取 `~/Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX`。
@@ -181,8 +205,9 @@ models/derived/<artifact-id>/
   `present.13.key/value`，4 个 full 层复用 `present.14.key/value`。把共享 cache 切成
   `past` + `new`，每个 donor 只切一次，16/4 层共用；每层加 1 个 GQA。
   判定条件是 CPU 数值等价；产物在 `models/derived/gemma4-e2b-q4f16-gate2/`。
-- **Gate 3 — measure**：同会话交替 A/B，4 轮中位数；同时记录 runtime 版本和 loadavg。
-  还必须先确认浏览器 WebGPU 端的 GQA 也遵守「声明 present 输出才读 past」这个行为。
+- **Gate 3 — measure（已完成，负结果）**：同会话交替 A/B，4–6 轮中位数，
+  记录 runtime 版本和 loadavg。全量融合只快 1.9–3.4%，低于 10% 门槛。
+  浏览器等价性通过；计时失败。融合这条线到此为止。
 
 ## 非目标
 

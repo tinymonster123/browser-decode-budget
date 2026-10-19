@@ -7,7 +7,7 @@ ARTIFACT ?= models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f1
 GATE1 ?= models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f16.onnx
 GATE2 ?= models/derived/gemma4-e2b-q4f16-gate2/onnx/decoder_model_merged_q4f16.onnx
 
-.PHONY: test census cost gate0 gate1 gate1-check gate2 gate2-check
+.PHONY: test census cost gate0 gate1 gate1-check gate2 gate2-check bench-prepare bench
 
 test:
 	$(PY) -m unittest discover -s tools/tests -v
@@ -54,3 +54,9 @@ gate2-check:
 	$(PY) tools/compare_models.py --a "$(DECODER)" --b "$(GATE2)" \
 		--tokens 1 --past 4 --seed 1 \
 		--json runs/2026-10-19-gate2-equivalence-cumulative.json
+
+bench-prepare:
+	node bench/browser/prepare.mjs
+
+bench: bench-prepare
+	node bench/browser/run.mjs
