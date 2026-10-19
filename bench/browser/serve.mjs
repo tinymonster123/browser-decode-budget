@@ -10,26 +10,18 @@
 
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { homedir } from 'node:os';
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { artifact, artifactNames, modelRoute } from './artifacts.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 8123);
-
-const BASE = resolve(
-  process.env.MODEL_BASE ??
-    join(homedir(), 'Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX'),
-);
-const GATE1 = resolve(
-  process.env.MODEL_GATE1 ??
-    join(here, '../../models/derived/gemma4-e2b-q4f16-gate1'),
-);
-const GATE2 = resolve(
-  process.env.MODEL_GATE2 ??
-    join(here, '../../models/derived/gemma4-e2b-q4f16-gate2'),
-);
 const VENDOR = join(here, 'vendor');
+
+const MODELS = new Map(
+  artifactNames().map((name) => [name, artifact(name).root]),
+);
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -98,12 +90,9 @@ const server = createServer((req, res) => {
     file = safeJoin(here, pathname.slice(1));
   } else if (pathname.startsWith('/vendor/')) {
     file = safeJoin(VENDOR, pathname.slice('/vendor/'.length));
-  } else if (pathname.startsWith('/base/')) {
-    file = safeJoin(BASE, pathname.slice('/base/'.length));
-  } else if (pathname.startsWith('/gate1/')) {
-    file = safeJoin(GATE1, pathname.slice('/gate1/'.length));
-  } else if (pathname.startsWith('/gate2/')) {
-    file = safeJoin(GATE2, pathname.slice('/gate2/'.length));
+  } else {
+    const route = modelRoute(pathname);
+    if (route) file = safeJoin(MODELS.get(route.name), route.relative);
   }
 
   if (!file || !existsSync(file) || !statSync(file).isFile()) {
@@ -122,7 +111,7 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`serving on http://127.0.0.1:${PORT}/`);
-  console.log(`  base  -> ${BASE}`);
-  console.log(`  gate1 -> ${GATE1}`);
-  console.log(`  gate2 -> ${GATE2}`);
+  for (const [name, dir] of MODELS) {
+    console.log(`  ${name.padEnd(5)} -> ${dir}`);
+  }
 });

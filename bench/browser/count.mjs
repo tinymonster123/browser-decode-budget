@@ -16,6 +16,7 @@ import {
   countsRun,
   timingRun,
 } from '../analysis/ledger.mjs';
+import { nodeCounts } from './artifacts.mjs';
 import {
   announceLoad,
   instrumentPage,
@@ -34,8 +35,7 @@ const MODELS = (process.env.MODELS ?? 'base,gate1,gate2').split(',').filter(Bool
 const OUT =
   process.env.OUT ?? join(root, 'runs', '2026-10-19-exp2-dispatch-count.json');
 
-// From docs/experiments/2026-10-19-gate0-census.md and the gate reports.
-const NODES = { base: 1289, gate1: 1233, gate2: 1078 };
+const NODES = nodeCounts();
 
 const load = announceLoad();
 

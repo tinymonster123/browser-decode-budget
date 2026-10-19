@@ -8,6 +8,7 @@
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { nodeCounts } from './artifacts.mjs';
 import {
   announceLoad,
   instrumentPage,
@@ -25,7 +26,7 @@ const HEADLESS = process.env.HEADLESS === '1';
 const MODELS = (process.env.MODELS ?? 'base,gate1,gate2').split(',').filter(Boolean);
 const OUT = process.env.OUT ?? join(root, 'runs', '2026-10-19-exp4-pass-profile.json');
 
-const NODES = { base: 1289, gate1: 1233, gate2: 1078 };
+const NODES = nodeCounts();
 
 const load = announceLoad();
 
