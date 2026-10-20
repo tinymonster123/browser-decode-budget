@@ -1,10 +1,11 @@
-# fused-onnx
+# browser-decode-budget
 
-独立的 fused ONNX 实验台。目标只有一个：**验证「减少 WebGPU dispatch 次数」能不能把浏览器里的
-decode 真正压下来**。产品接入是附属产物，不是本项目的主线。
+浏览器里 LLM decode 的时间账。项目从「减少 WebGPU dispatch 能不能把 decode 压下来」
+这个问题开始；Gate 6 用实测负结果关闭了这条路线（tag `gate6-closed`），
+现在的主线是**把这 27.2 ms 拆开**：哪些字节必须搬，哪些是调度和实现浪费。
 
-从 `gemma-translate` 的 decode 实验中抽出。那边的结论是 decode 29.9 ms/token，
-瓶颈在每算子 dispatch / 同步，而不是算力；本项目从那里开始。
+从 `gemma-translate` 的 decode 实验中抽出。那边看到的是 29.9 ms/token；本项目
+先证伪了「瓶颈在每算子 dispatch」这个假设，再转向成本归因。
 
 ## 状态
 
@@ -14,6 +15,9 @@ decode 真正压下来**。产品接入是附属产物，不是本项目的主�
 | **1** | 3 层 full-attention 能否换成 GQA？ | ✅ 2026-10-19 | **PASS**：1289→1233，logits cosine 0.999998 |
 | **2** | 20 层 shared-KV 能否映射到 GQA？ | ✅ 2026-10-19 | **PASS**：1233→1078，35/35 层全 GQA |
 | **3** | 浏览器里真的更快吗？ | ❌ 2026-10-19 | **FAIL**：只快 1.9–3.4%，低于 10% 门槛；按 kill criterion 停止 |
+| **4** | 删节点为什么没换成时间？ | ✅ 2026-10-19 | 一次 dispatch 1.32 µs；1112 次全删也只有 5.4% |
+| **5** | 27 ms 到底花在哪？ | ✅ 2026-10-19 | 最贵的 1 个 pass 占 13%；LM head 2.6 ms 只发 1 次 dispatch |
+| **6** | 还有没有 ≥10% 的路线？ | ❌ 2026-10-20 | **三条路线全关，无 frontier ticket**；见 `gate6-closed` |
 
 Gate 0 的完整报告见 [`docs/experiments/2026-10-19-gate0-census.md`](docs/experiments/2026-10-19-gate0-census.md)，
 Gate 1 见 [`docs/experiments/2026-10-19-gate1-manual-fusion.md`](docs/experiments/2026-10-19-gate1-manual-fusion.md)，
@@ -188,10 +192,37 @@ decode step 拆成 208–266 个 GPU 时间段。
 
 详见 [`docs/experiments/2026-10-19-gate5-gpu-pass-profile.md`](docs/experiments/2026-10-19-gate5-gpu-pass-profile.md)。
 
+## Gate 6 结果（负结果）：没有 ≥10% 的剩余路线
+
+判据先于结果：一条路线只有在 token 级实测空间 ≥10% 时才进入下一轮。
+
+| 路线 | 决定数字 | 状态 |
+|---|---|---|
+| 减少 dispatch / 节点融合 | 实测 base→gate2 **−1.9%**；GPU 侧上界 **7.0%** | 关闭 |
+| LM head 带宽优化 | 已占读带宽 **79–82%**；整 pass 只占 token **9.92%** | 关闭 |
+| dtype（q4f16→fp16） | fp16 字节是 **3.46×**，且已在带宽墙附近 | 关闭（未运行） |
+
+两条主路线是在**上限**上失败的：即使 1112 次 dispatch 全删也只有 7.0%，
+即使 LM head 的 kernel 完全免费也只有 9.92%。在同一批文件上继续做图手术不会
+改变结论。
+
+**这笔账的现状：**
+
+| 分项 | 时间 | 性质 |
+|---|---:|---|
+| 每 token 必须读的 1.52 GB 权重 @ 109 GB/s | **13.93 ms（51.2%）** | 物理下界 |
+| 实测总时间 | 27.2 ms | `runs/2026-10-19-exp2-dispatch-count.json` |
+| GPU pass 时间之和 | 20.3–26.5 ms | 与 wall 同量级，GPU 全程在跑 |
+| CPU 调度管线 | 3.0–3.3 ms（12%） | 与 GPU 执行重叠 |
+
+地板上方还有约 13 ms 没有按 op class 归因（attention/KV、200+ 个小 pass、
+pass 间隙）。详见
+[`docs/experiments/2026-10-20-gate6-decision.md`](docs/experiments/2026-10-20-gate6-decision.md)。
+
 ## 目录
 
 ```text
-fused-onnx/
+browser-decode-budget/
 ├─ tools/
 │  ├─ inspect_graph.py      # Census：逐层算子统计、融合候选、可删节点估算
 │  ├─ dispatch_cost.py      # 把 census + 实测基线变成时间投影
@@ -200,8 +231,8 @@ fused-onnx/
 │  ├─ compare_models.py     # CPU ORT 数值等价性检查
 │  └─ tests/                # 合成 ONNX fixture 的单测
 ├─ bench/
-│  ├─ browser/              # Gate 3：交替 A/B；Gate 4：计数 + 单价；Gate 5：逐 pass 计时
-│  └─ analysis/             # Gate 6：ledger → 数字的纯函数 seam（不碰浏览器/GPU）
+│  ├─ browser/              # 驱动层：driver.mjs 是唯一入口（服务器/页面/ledger/退出码）
+│  └─ analysis/             # ledger → 数字的纯函数 seam（不碰浏览器/GPU）
 ├─ models/                  # gitignored；见 models/README.md
 ├─ runs/                    # 每次实验的 JSON ledger（进 git）
 └─ docs/experiments/        # 实验记录，负结果同样保留
@@ -268,6 +299,11 @@ models/derived/<artifact-id>/
 - **Gate 3 — measure（已完成，负结果）**：同会话交替 A/B，4–6 轮中位数，
   记录 runtime 版本和 loadavg。全量融合只快 1.9–3.4%，低于 10% 门槛。
   浏览器等价性通过；计时失败。融合这条线到此为止。
+- **Gate 4 — 量纲（已完成）**：数真实 dispatch、测单价。结论是节点数不能当成本尺子。
+- **Gate 5 — 逐 pass 归因（已完成）**：给每个 compute pass 加 timestamp，找到 LM head
+  这个单 dispatch、2.6 ms 的下限。
+- **Gate 6 — 路线筛选（已完成，负结果）**：dispatch、LM head 带宽、dtype 三条全关。
+  本仓库在 `gate6-closed` 处冻结了这段历史；后续工作从「地板之上的 13 ms 归因」开始。
 
 ## 非目标
 

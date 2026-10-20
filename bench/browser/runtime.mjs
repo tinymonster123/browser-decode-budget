@@ -87,7 +87,7 @@ const CHROME_ARGS = [
 export async function launchChrome({
   headless = false,
   viewport = { width: 1100, height: 900 },
-  label = 'fused-onnx',
+  label = 'browser-decode-budget',
   persistent = true,
 } = {}) {
   const { chromium } = loadPlaywright();
@@ -134,7 +134,7 @@ export async function openPage({
   url,
   headless = false,
   viewport,
-  label = 'fused-onnx',
+  label = 'browser-decode-budget',
   prefix = label,
   persistent = true,
   onResponse = false,

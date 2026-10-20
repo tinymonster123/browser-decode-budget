@@ -7,7 +7,7 @@
 //
 // Untested by design, like the rest of the browser harness.
 
-export const WRAPPED = Symbol('fused-onnx.wrapped');
+export const WRAPPED = Symbol('browser-decode-budget.wrapped');
 
 export function wrapMethod(proto, name, factory) {
   if (!proto) return false;

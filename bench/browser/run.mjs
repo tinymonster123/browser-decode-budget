@@ -7,47 +7,25 @@
 // Env:
 //   REPEATS=4 MAX_NEW=64 HEADLESS=1 PORT=8123 MODEL_BASE=... MODEL_GATE2=...
 
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
 import { artifact } from './artifacts.mjs';
 import {
-  announceLoad,
-  openPage,
-  startServer,
-  stampLedger,
-  writeLedger,
-} from './runtime.mjs';
+  envNumber,
+  envText,
+  ledgerPath,
+  median,
+  runDriver,
+} from './driver.mjs';
 
-const here = dirname(fileURLToPath(import.meta.url));
-const root = resolve(here, '../..');
-const PORT = Number(process.env.PORT ?? 8123);
-const REPEATS = Math.max(1, Number(process.env.REPEATS ?? 4));
-const MAX_NEW = Math.max(1, Number(process.env.MAX_NEW ?? 64));
-const HEADLESS = process.env.HEADLESS === '1';
-const A_MODEL = process.env.A_MODEL ?? 'base';
-const A_NAME = process.env.A_NAME ?? A_MODEL;
-const B_MODEL = process.env.B_MODEL ?? 'gate2';
-const B_NAME = process.env.B_NAME ?? B_MODEL;
-const OUT =
-  process.env.OUT ??
-  process.env.GATE3_OUT ??
-  join(root, 'runs', `2026-10-19-gate3-${A_NAME}-vs-${B_NAME}.json`);
+const REPEATS = Math.max(1, envNumber('REPEATS', 4));
+const MAX_NEW = Math.max(1, envNumber('MAX_NEW', 64));
+const A_MODEL = envText('A_MODEL', 'base');
+const A_NAME = envText('A_NAME', A_MODEL);
+const B_MODEL = envText('B_MODEL', 'gate2');
+const B_NAME = envText('B_NAME', B_MODEL);
 
 // Names must exist in the registry: the server only routes registered roots.
 artifact(A_MODEL);
 artifact(B_MODEL);
-
-const load = announceLoad();
-
-const server = startServer(PORT);
-
-function median(values) {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
 
 function summarize(rounds) {
   const byName = new Map();
@@ -55,7 +33,12 @@ function summarize(rounds) {
     if (!run.tokens || run.firstTokenMs == null || run.lastTokenMs == null) continue;
     const decodeMs = run.lastTokenMs - run.firstTokenMs;
     const msPerToken = run.tokens > 1 ? decodeMs / (run.tokens - 1) : null;
-    const entry = byName.get(run.name) ?? { runs: [], msPerToken: [], totalMs: [], tokens: [] };
+    const entry = byName.get(run.name) ?? {
+      runs: [],
+      msPerToken: [],
+      totalMs: [],
+      tokens: [],
+    };
     entry.runs.push(run);
     if (msPerToken != null) entry.msPerToken.push(msPerToken);
     entry.totalMs.push(run.ms);
@@ -75,92 +58,99 @@ function summarize(rounds) {
   return summary;
 }
 
-let context;
-try {
-  await server.ready;
+await runDriver({
+  name: 'bench',
+  port: envNumber('PORT', 8123),
+  out: ledgerPath('OUT', 'runs/2026-10-19-gate3-base-vs-gate2.json'),
+  config: {
+    repeats: REPEATS,
+    maxNewTokens: MAX_NEW,
+    aModel: A_MODEL,
+    aName: A_NAME,
+    bModel: B_MODEL,
+    bName: B_NAME,
+  },
 
-  console.log('opening page…');
-  const opened = await openPage({
-    url: `http://127.0.0.1:${PORT}/`,
-    headless: HEADLESS,
-    label: 'fused-onnx-bench',
-    prefix: 'page',
-    onResponse: true,
-    onReadyTimeout: async (page) => {
-      console.log('[page] __ready never became true');
-      await page.screenshot({ path: '/tmp/fused-onnx-bench-failed.png', fullPage: true });
-    },
-  });
-  context = opened.context;
-  const page = opened.page;
-  console.log('page ready');
-
-  console.log(
-    `launching: repeats=${REPEATS} max_new_tokens=${MAX_NEW} headless=${HEADLESS} ` +
-      `a=${A_MODEL}/${A_NAME} b=${B_MODEL}/${B_NAME}`,
-  );
-  const result = await page.evaluate(
-    (options) => window.__bench(options),
-    {
-      repeats: REPEATS,
-      maxNewTokens: MAX_NEW,
-      aModel: A_MODEL,
-      aName: A_NAME,
-      bModel: B_MODEL,
-      bName: B_NAME,
-    },
-  );
-
-  if (result.error) {
-    console.error(`page error: ${result.error}`);
-    if (result.stack) console.error(result.stack);
-  }
-
-  const summary = summarize(result.rounds ?? []);
-  const a = summary[A_NAME]?.medianMsPerToken;
-  const b = summary[B_NAME]?.medianMsPerToken;
-  const delta = a && b ? (100 * (b - a)) / a : null;
-
-  console.log('\nvariant   median ms/token   median total ms   tokens');
-  for (const name of [A_NAME, B_NAME]) {
-    const row = summary[name];
-    if (!row) continue;
-    console.log(
-      `${name.padEnd(9)} ${String(row.medianMsPerToken?.toFixed(2)).padStart(15)} ` +
-        `${String(row.medianTotalMs).padStart(16)} ${String(row.medianTokens).padStart(8)}`,
+  async measure(ctx) {
+    ctx.log(
+      `launching: repeats=${REPEATS} max_new_tokens=${MAX_NEW} ` +
+        `headless=${ctx.headless} a=${A_MODEL}/${A_NAME} b=${B_MODEL}/${B_NAME}`,
     );
-  }
-  if (delta != null) console.log(`${B_NAME} vs ${A_NAME}: ${delta >= 0 ? '+' : ''}${delta.toFixed(1)}%`);
+    const result = await ctx.withPage(
+      {
+        path: '/',
+        label: `${ctx.name}-ab`,
+        prefix: 'page',
+        onResponse: true,
+        onReadyTimeout: async (page) => {
+          console.log('[page] __ready never became true');
+          await page.screenshot({
+            path: '/tmp/browser-decode-budget-bench-failed.png',
+            fullPage: true,
+          });
+        },
+      },
+      (page) =>
+        page.evaluate(
+          (options) => window.__bench(options),
+          {
+            repeats: REPEATS,
+            maxNewTokens: MAX_NEW,
+            aModel: A_MODEL,
+            aName: A_NAME,
+            bModel: B_MODEL,
+            bName: B_NAME,
+          },
+        ),
+    );
+    return { result, summary: summarize(result.rounds ?? []) };
+  },
 
-  if (result.equivalence) {
-    console.log(`\nequivalence: exact=${result.equivalence.exact}`);
-    if (!result.equivalence.exact) {
-      console.log(`  ${A_NAME}: ${JSON.stringify(result.equivalence.aText.slice(0, 400))}`);
-      console.log(`  ${B_NAME}: ${JSON.stringify(result.equivalence.bText.slice(0, 400))}`);
+  checks({ result }) {
+    return [
+      {
+        name: 'page',
+        ok: !result.error,
+        detail: result.error ?? 'bench completed',
+      },
+    ];
+  },
+
+  report({ result, summary }) {
+    if (result.error) {
+      console.error(`page error: ${result.error}`);
+      if (result.stack) console.error(result.stack);
     }
-  }
 
-  const ledger = stampLedger({
-    root,
-    load,
-    config: {
-      repeats: REPEATS,
-      maxNewTokens: MAX_NEW,
-      port: PORT,
-      headless: HEADLESS,
-      aModel: A_MODEL,
-      aName: A_NAME,
-      bModel: B_MODEL,
-      bName: B_NAME,
-    },
-    summary,
-    result,
-  });
-  writeLedger(OUT, ledger);
-  console.log(`\nwrote ${OUT}`);
+    const a = summary[A_NAME]?.medianMsPerToken;
+    const b = summary[B_NAME]?.medianMsPerToken;
+    const delta = a && b ? (100 * (b - a)) / a : null;
 
-  if (result.error) process.exitCode = 1;
-} finally {
-  await context?.close();
-  server.stop();
-}
+    console.log('\nvariant   median ms/token   median total ms   tokens');
+    for (const name of [A_NAME, B_NAME]) {
+      const row = summary[name];
+      if (!row) continue;
+      console.log(
+        `${name.padEnd(9)} ${String(row.medianMsPerToken?.toFixed(2)).padStart(15)} ` +
+          `${String(row.medianTotalMs).padStart(16)} ${String(row.medianTokens).padStart(8)}`,
+      );
+    }
+    if (delta != null) {
+      console.log(
+        `${B_NAME} vs ${A_NAME}: ${delta >= 0 ? '+' : ''}${delta.toFixed(1)}%`,
+      );
+    }
+
+    if (result.equivalence) {
+      console.log(`\nequivalence: exact=${result.equivalence.exact}`);
+      if (!result.equivalence.exact) {
+        console.log(`  ${A_NAME}: ${JSON.stringify(result.equivalence.aText.slice(0, 400))}`);
+        console.log(`  ${B_NAME}: ${JSON.stringify(result.equivalence.bText.slice(0, 400))}`);
+      }
+    }
+  },
+
+  ledger({ result, summary }) {
+    return { summary, result };
+  },
+});

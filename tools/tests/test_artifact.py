@@ -44,9 +44,9 @@ class ArtifactTest(unittest.TestCase):
 
     def test_sha256_file_hashes_content(self) -> None:
         path = self.root / "payload.bin"
-        path.write_bytes(b"fused-onnx")
+        path.write_bytes(b"browser-decode-budget")
 
-        self.assertEqual(sha256_file(path), hashlib.sha256(b"fused-onnx").hexdigest())
+        self.assertEqual(sha256_file(path), hashlib.sha256(b"browser-decode-budget").hexdigest())
 
     def test_write_artifact_copies_siblings_and_writes_manifest(self) -> None:
         out_dir = self.root / "artifact"

@@ -35,7 +35,7 @@ test('stampLedger: one envelope, caller load preserved', () => {
 });
 
 test('writeLedger: creates the parent directory and writes JSON', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'fused-onnx-ledger-'));
+  const dir = mkdtempSync(join(tmpdir(), 'browser-decode-budget-ledger-'));
   try {
     const out = join(dir, 'nested', 'run.json');
     writeLedger(out, { commit: 'abc1234', results: [] });

@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues live in GitHub Issues on `tinymonster123/fused-onnx`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues on `tinymonster123/browser-decode-budget`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
