@@ -8,7 +8,7 @@ GATE1 ?= models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f16.o
 GATE2 ?= models/derived/gemma4-e2b-q4f16-gate2/onnx/decoder_model_merged_q4f16.onnx
 
 .PHONY: test test-js census cost gate0 gate1 gate1-check gate2 gate2-check bench-prepare bench \
-	bench-op-attribution bench-matmul-efficiency bench-bandwidth \
+	bench-op-attribution bench-matmul-efficiency bench-gate9 bench-bandwidth \
 	lm-head-weights lm-head-utilization weight-bytes
 
 test:
@@ -90,6 +90,10 @@ bench-op-attribution: bench-prepare
 # Gate 8: effective bandwidth per MatMulNBits weight size.
 bench-matmul-efficiency: bench-prepare
 	node bench/browser/matmul-efficiency.mjs
+
+# Gate 9: workgroup counts + split vs batched replay of the same dispatch.
+bench-gate9: bench-prepare
+	node bench/browser/gate9-discrimination.mjs
 
 # Gate 6: LM head weight bytes (recorded once), then utilization from ledgers.
 lm-head-weights:

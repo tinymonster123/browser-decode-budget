@@ -46,10 +46,17 @@
 
       configureEnv();
 
+      // Four profiled steps are 4,448 dispatches; the cap leaves room for
+      // longer runs without letting the log grow without bound.
+      const MAX_DISPATCH_LOG = 20000;
+
       let ortDevice = null;
       let profileEnabled = false;
       let passSeq = 0;
       let records = [];
+      let dispatchLog = [];
+      let uniformWriteCount = 0;
+      let uniformWriteBuffers = new Set();
       let patchInfo = {
         pass: false,
         encoder: false,
@@ -57,15 +64,18 @@
         shader: false,
         pipeline: false,
         bindGroup: false,
+        queueWrite: false,
         featureInjected: false,
       };
 
       // Creation-time metadata. Pipelines are reused across steps, so these
       // maps must live for the whole session, not per profile step.
-      const modules = new WeakMap(); // GPUShaderModule -> { label, hash, codeLength }
+      const modules = new WeakMap(); // GPUShaderModule -> { label, hash, codeLength, workgroupSize }
       const pipelines = new WeakMap(); // GPUComputePipeline -> { label, module, key }
       const identityDetails = new Map(); // key -> what the descriptor revealed
       const bindGroupSizes = new WeakMap(); // GPUBindGroup -> buffer sizes it binds
+      const bindGroupRefs = new WeakMap(); // GPUBindGroup -> the buffers it binds
+      const lastUniformWrite = new WeakMap(); // GPUBuffer -> most recent queue.writeBuffer
 
       let nextModuleId = 0;
       let nextPipelineId = 0;
@@ -85,6 +95,34 @@
         return meta?.key ?? 'unlabeled';
       }
 
+      // Gate 9 needs the launched workgroup count and the workgroup's size to
+      // turn a dispatch into an occupancy proxy. The size is a literal in the
+      // shader source ORT compiles, so read it where the code is visible.
+      function parseWorkgroupSize(code) {
+        const literal =
+          /@workgroup_size\s*\(\s*(\d+)(?:\s*,\s*(\d+))?(?:\s*,\s*(\d+))?\s*\)/.exec(code);
+        if (literal) {
+          return [Number(literal[1]), Number(literal[2] ?? 1), Number(literal[3] ?? 1)];
+        }
+
+        // ORT emits `@workgroup_size(workgroup_size_x, …)` and declares the
+        // three values as u32 constants. Resolve those names instead of
+        // guessing a default size.
+        const named =
+          /@workgroup_size\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)/.exec(
+            code,
+          );
+        if (!named) return null;
+        const valueOf = (name) => {
+          const declaration = new RegExp(
+            `(?:const\\s+)?${name}\\s*:\\s*u32\\s*=\\s*(\\d+)`,
+          ).exec(code);
+          return declaration ? Number(declaration[1]) : null;
+        };
+        const values = [valueOf(named[1]), valueOf(named[2]), valueOf(named[3])];
+        return values.every((value) => value != null) ? values : null;
+      }
+
       // writeTimestamp() inside a pass needs an experimental feature this
       // Chrome does not expose. The exact alternative is one pass per
       // dispatch: a pass boundary timestamp then IS the dispatch timestamp.
@@ -98,6 +136,7 @@
           bindGroups: new Map(),
           pipelines: [],
           dispatches: 0,
+          workgroups: null,
         };
         let inner = null;
         let slot = null;
@@ -134,26 +173,54 @@
         const flush = () => {
           if (!inner) return;
           inner.end();
-          if (slot != null && state.dispatches > 0) {
+          if (state.dispatches > 0 && state.pipeline) {
             // Flatten the sizes of the bind groups bound at this moment. The
             // Map replaces an index on rebind, so a replayed group is not
             // counted twice, while distinct groups keep their multiplicity.
+            const bound = [...state.bindGroups.entries()];
             const buffers = [];
-            for (const { group } of state.bindGroups.values()) {
+            const refs = new Set();
+            for (const [, { group }] of bound) {
               buffers.push(...(bindGroupSizes.get(group) ?? []));
+              for (const buffer of bindGroupRefs.get(group) ?? []) refs.add(buffer);
             }
-            rec.passes.push({
-              seq: passSeq++,
-              slot,
-              dispatches: state.dispatches,
-              pipelines: [...new Set(state.pipelines)],
-              buffers,
-            });
+            const workgroupSize = pipelines.get(state.pipeline)?.workgroupSize ?? null;
+
+            // Gate 9 replay needs the exact objects, not just their sizes, so
+            // it can submit the same dispatch again outside ORT's encoder.
+            if (dispatchLog.length < MAX_DISPATCH_LOG) {
+              dispatchLog.push({
+                key: state.pipelineKey,
+                pipeline: state.pipeline,
+                bindGroups: bound.map(([index, { group, offsets }]) => ({
+                  index,
+                  group,
+                  offsets,
+                })),
+                workgroups: state.workgroups,
+                workgroupSize,
+                buffers,
+                refs: [...refs],
+              });
+            }
+
+            if (slot != null) {
+              rec.passes.push({
+                seq: passSeq++,
+                slot,
+                dispatches: state.dispatches,
+                pipelines: [...new Set(state.pipelines)],
+                buffers,
+                workgroups: state.workgroups,
+                workgroupSize,
+              });
+            }
           }
           inner = null;
           slot = null;
           state.dispatches = 0;
           state.pipelines = [];
+          state.workgroups = null;
         };
 
         return {
@@ -167,13 +234,17 @@
             state.bindGroups.set(index, { group, offsets });
             ensure().setBindGroup(index, group, ...offsets);
           },
-          dispatchWorkgroups(...args) {
-            ensure().dispatchWorkgroups(...args);
+          dispatchWorkgroups(x = 1, y = 1, z = 1) {
+            ensure().dispatchWorkgroups(x, y, z);
+            state.workgroups = [x, y, z];
             state.dispatches += 1;
             flush();
           },
           dispatchWorkgroupsIndirect(...args) {
             ensure().dispatchWorkgroupsIndirect(...args);
+            // The indirect buffer is not read back; a null count stays visible
+            // as missing workgroup data instead of being guessed.
+            state.workgroups = null;
             state.dispatches += 1;
             flush();
           },
@@ -216,15 +287,43 @@
             function (desc) {
               const group = orig.call(this, desc);
               const sizes = [];
+              const refs = new Set();
               for (const entry of desc?.entries ?? []) {
                 const resource = entry?.resource;
                 const buffer = resource?.buffer;
-                if (buffer) sizes.push(resource.size ?? buffer.size);
+                if (buffer) {
+                  sizes.push(resource.size ?? buffer.size);
+                  refs.add(buffer);
+                }
               }
               bindGroupSizes.set(group, sizes);
+              bindGroupRefs.set(group, [...refs]);
               return group;
             },
           ) || patchInfo.bindGroup;
+
+        // Gate 9 replays a recorded dispatch after the model has stopped
+        // generating. ORT writes each node's shape uniform with writeBuffer
+        // once per token, so keeping the last write lets the replay restore
+        // the small per-node buffers before timing. Counting distinct buffers
+        // also exposes whether uniforms are per-node or shared.
+        patchInfo.queueWrite =
+          wrapMethod(protos.queue, 'writeBuffer', (orig) =>
+            function (buffer, offset, ...rest) {
+              if (profileEnabled && this === ortDevice?.queue) {
+                const data = rest[0];
+                if (ArrayBuffer.isView(data) || data instanceof ArrayBuffer) {
+                  const bytes = ArrayBuffer.isView(data)
+                    ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice()
+                    : new Uint8Array(data.slice(0));
+                  lastUniformWrite.set(buffer, { offset, data: bytes });
+                  uniformWriteCount += 1;
+                  uniformWriteBuffers.add(buffer);
+                }
+              }
+              return orig.call(this, buffer, offset, ...rest);
+            },
+          ) || patchInfo.queueWrite;
 
         patchInfo.shader =
           wrapMethod(protos.device, 'createShaderModule', (orig) =>
@@ -236,6 +335,7 @@
                 label: desc?.label ?? '',
                 hash: code ? fnv1a(code) : '',
                 codeLength: code.length,
+                workgroupSize: parseWorkgroupSize(code),
                 preview: code.slice(0, 240).replace(/\s+/g, ' '),
               });
               return module;
@@ -261,6 +361,7 @@
             label,
             entryPoint,
             module: moduleMeta ?? null,
+            workgroupSize: moduleMeta?.workgroupSize ?? null,
             key,
           });
           if (!identityDetails.has(key)) {
@@ -368,6 +469,8 @@
             dispatches: segment.dispatches,
             pipelines: segment.pipelines,
             buffers: segment.buffers,
+            workgroups: segment.workgroups ?? null,
+            workgroupSize: segment.workgroupSize ?? null,
           })),
         };
       }
@@ -402,6 +505,9 @@
           await generate(loaded.pipe, 2, text);
 
           records = [];
+          dispatchLog = [];
+          uniformWriteCount = 0;
+          uniformWriteBuffers = new Set();
           passSeq = 0;
           const stepMarks = [];
           const tokenTimes = [];
@@ -443,6 +549,11 @@
           result.patchInfo = { ...patchInfo };
           result.identities = [...seenPipelines].sort();
           result.identityDetails = Object.fromEntries(identityDetails);
+          result.dispatchLogged = dispatchLog.length;
+          result.uniformWrites = {
+            calls: uniformWriteCount,
+            distinctBuffers: uniformWriteBuffers.size,
+          };
         } catch (error) {
           result.error = String(error);
           result.stack = error?.stack ?? null;
@@ -453,7 +564,261 @@
         return result;
       }
 
+      // --- Gate 9: replay one recorded dispatch in two encodings ----------
+      //
+      // Gate 7/8 had to give every dispatch its own pass to get a timestamp.
+      // That removes the overlap a shared pass allows and adds one pass
+      // boundary per dispatch, so the per-dispatch numbers need a correction.
+      //
+      // Replaying the same recorded dispatch N times (a) inside one pass and
+      // (b) in N passes measures the encoding cost on the real pipeline and
+      // the real buffers. Consecutive repeats write the same output buffer,
+      // so WebGPU's ordering serializes them just like a dependent chain; the
+      // measurement is not flattered by accidental overlap. The weight stays
+      // hot across repeats, which biases against the small-kernel hypothesis:
+      // if a hot 0.22 MiB weight is still slow, the cache is not the answer.
+
+      function median(values) {
+        const clean = values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+        if (!clean.length) return null;
+        const middle = Math.floor(clean.length / 2);
+        return clean.length % 2 ? clean[middle] : (clean[middle - 1] + clean[middle]) / 2;
+      }
+
+      function makeTimer(device) {
+        // The query set, resolve buffer and read buffer are the same trio the
+        // attribution run uses; keep them defined in one place.
+        return newEncoderRecord(device);
+      }
+
+      async function readTimer(device, timer, count) {
+        await timer.readBuf.mapAsync(GPUMapMode.READ, 0, count * 8);
+        const view = new BigInt64Array(timer.readBuf.getMappedRange(0, count * 8));
+        const values = [];
+        for (let i = 0; i + 1 < count; i += 2) {
+          values.push(Number(view[i + 1] - view[i]) / 1000);
+        }
+        timer.readBuf.unmap();
+        return values;
+      }
+
+      function bindSample(pass, sample) {
+        pass.setPipeline(sample.pipeline);
+        for (const { index, group, offsets } of sample.bindGroups) {
+          if (offsets.length) pass.setBindGroup(index, group, ...offsets);
+          else pass.setBindGroup(index, group);
+        }
+      }
+
+      async function timeBatched(device, timer, sample, count) {
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass({
+          timestampWrites: {
+            querySet: timer.qs,
+            beginningOfPassWriteIndex: 0,
+            endOfPassWriteIndex: 1,
+          },
+        });
+        bindSample(pass, sample);
+        for (let i = 0; i < count; i += 1) {
+          pass.dispatchWorkgroups(...sample.workgroups);
+        }
+        pass.end();
+        enc.resolveQuerySet(timer.qs, 0, 2, timer.resolveBuf, 0);
+        enc.copyBufferToBuffer(timer.resolveBuf, 0, timer.readBuf, 0, 16);
+        device.queue.submit([enc.finish()]);
+        const [us] = await readTimer(device, timer, 2);
+        return us;
+      }
+
+      async function timeSplit(device, timer, sample, count) {
+        const enc = device.createCommandEncoder();
+        for (let i = 0; i < count; i += 1) {
+          const pass = enc.beginComputePass({
+            timestampWrites: {
+              querySet: timer.qs,
+              beginningOfPassWriteIndex: i * 2,
+              endOfPassWriteIndex: i * 2 + 1,
+            },
+          });
+          bindSample(pass, sample);
+          pass.dispatchWorkgroups(...sample.workgroups);
+          pass.end();
+        }
+        enc.resolveQuerySet(timer.qs, 0, count * 2, timer.resolveBuf, 0);
+        enc.copyBufferToBuffer(timer.resolveBuf, 0, timer.readBuf, 0, count * 16);
+        device.queue.submit([enc.finish()]);
+        const passUs = await readTimer(device, timer, count * 2);
+        return {
+          totalUs: passUs.reduce((sum, us) => sum + us, 0),
+        };
+      }
+
+      async function replayKernels({
+        opKey = 'op:MatMulNBits',
+        counts = [1, 4, 16, 64],
+        repeats = 7,
+      } = {}) {
+        const result = {
+          opKey,
+          counts,
+          repeats,
+          classes: [],
+          skipped: 0,
+          uniformWrites: {
+            calls: uniformWriteCount,
+            distinctBuffers: uniformWriteBuffers.size,
+            restored: 0,
+          },
+          error: null,
+          stack: null,
+        };
+
+        try {
+          const device = ortDevice;
+          if (!device) throw new Error('replay: no ORT device');
+          if (!dispatchLog.length) {
+            throw new Error('replay: no dispatch log; run attribution first');
+          }
+          const usableCounts = counts.filter(
+            (count) => Number.isInteger(count) && count >= 1 && count * 2 <= MAX_QUERIES,
+          );
+          if (usableCounts.length < 2) {
+            throw new Error('replay: need two counts that fit the query set');
+          }
+
+          const groups = new Map();
+          for (const entry of dispatchLog) {
+            if (entry.key !== opKey || !entry.pipeline) continue;
+            if (!Array.isArray(entry.workgroups)) {
+              result.skipped += 1;
+              continue;
+            }
+            const buffers = [...entry.buffers].sort((a, b) => a - b);
+            // Byte size alone is not one kernel: the graph can hold two
+            // shapes with the same initializer bytes (e.g. k_proj [256,48,16]
+            // and per-layer projection [1536,8,16]). The launched workgroup
+            // count separates them at runtime.
+            const workgroups = entry.workgroups
+              .map((value) => value ?? 1)
+              .join('x');
+            const signature = `${buffers.join(',')}|${workgroups}`;
+            let group = groups.get(signature);
+            if (!group) {
+              group = {
+                signature,
+                buffers,
+                refs: entry.refs ?? [],
+                sample: entry,
+                dispatches: 0,
+              };
+              groups.set(signature, group);
+            }
+            group.dispatches += 1;
+          }
+          if (!groups.size) throw new Error('replay: no replayable dispatches');
+
+          const timer = makeTimer(device);
+          const largest = [...groups.values()].sort(
+            (a, b) => Math.max(...b.buffers) - Math.max(...a.buffers),
+          )[0];
+
+          // Steady clock before any sample is recorded; discarded.
+          const warmCount = Math.min(8, usableCounts[usableCounts.length - 1]);
+          const warmUntil = performance.now() + 600;
+          while (performance.now() < warmUntil) {
+            await timeBatched(device, timer, largest.sample, warmCount);
+          }
+
+          for (const group of groups.values()) {
+            // Restore the last small write per node. Weight uploads happen at
+            // load time and are deliberately not repeated.
+            for (const buffer of group.refs) {
+              const write = lastUniformWrite.get(buffer);
+              if (write && buffer.size <= 4096 && write.data.byteLength <= 4096) {
+                device.queue.writeBuffer(buffer, write.offset, write.data);
+                result.uniformWrites.restored += 1;
+              }
+            }
+            await device.queue.onSubmittedWorkDone();
+
+            const batched = [];
+            const split = [];
+            for (let repeat = 0; repeat < repeats; repeat += 1) {
+              const order = repeat % 2 === 0 ? usableCounts : [...usableCounts].reverse();
+              const splitFirst = repeat % 2 === 1;
+              for (const count of order) {
+                const runBatched = async () => {
+                  const us = await timeBatched(device, timer, group.sample, count);
+                  batched.push({ count, repeat, us });
+                };
+                const runSplit = async () => {
+                  const measured = await timeSplit(device, timer, group.sample, count);
+                  split.push({ count, repeat, us: measured.totalUs });
+                };
+                if (splitFirst) {
+                  await runSplit();
+                  await runBatched();
+                } else {
+                  await runBatched();
+                  await runSplit();
+                }
+              }
+            }
+
+            const summarize = (samples) =>
+              usableCounts.map((count) => {
+                const values = samples
+                  .filter((sample) => sample.count === count)
+                  .map((sample) => sample.us);
+                return {
+                  count,
+                  medianUs: median(values),
+                  minUs: values.length ? Math.min(...values) : null,
+                  samples: values,
+                };
+              });
+
+            result.classes.push({
+              signature: group.signature,
+              buffers: group.buffers,
+              workgroups: group.sample.workgroups,
+              workgroupSize: group.sample.workgroupSize,
+              dispatches: group.dispatches,
+              batched: summarize(batched),
+              split: summarize(split),
+            });
+          }
+
+          timer.qs.destroy?.();
+          timer.resolveBuf.destroy();
+          timer.readBuf.destroy();
+        } catch (error) {
+          result.error = String(error);
+          result.stack = error?.stack ?? null;
+        }
+
+        status(result.error ? `error: ${result.error}` : 'done');
+        return result;
+      }
+
+      async function gate9({
+        model = 'base',
+        text = DEFAULT_TEXT,
+        profileTokens = 4,
+        replay = {},
+      } = {}) {
+        const attribution = await attribute({ model, text, profileTokens });
+        let replayResult = { classes: [], error: 'attribution failed' };
+        if (!attribution.error) {
+          status(`replaying recorded ${replay.opKey ?? 'MatMulNBits'} dispatches…`);
+          replayResult = await replayKernels(replay);
+        }
+        return { attribution, replay: replayResult };
+      }
+
       window.__attribute = attribute;
+      window.__gate9 = gate9;
       window.__ready = true;
       status('ready');
     </script>

@@ -6,6 +6,7 @@
 // code. Drivers never import `runtime.mjs` directly, so the browser plumbing
 // has one caller-facing seam.
 
+import { readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -80,6 +81,22 @@ export function median(values) {
   return sorted.length % 2
     ? sorted[middle]
     : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+export function readJson(path) {
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
+
+// Weight fingerprints are produced by `make weight-bytes` and consumed by
+// more than one driver. Reading them here keeps the validation in one place.
+export function knownFingerprints(path, opType) {
+  const fingerprints = readJson(path)?.fingerprints;
+  if (fingerprints?.opType !== opType || !Array.isArray(fingerprints.entries)) {
+    throw new Error(
+      `${path} has no fingerprints for ${opType}; run "make weight-bytes"`,
+    );
+  }
+  return fingerprints.entries;
 }
 
 export function quantile(values, fraction) {

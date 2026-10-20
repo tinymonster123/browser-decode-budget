@@ -552,12 +552,60 @@ function labelOf(key) {
   return key;
 }
 
+// A dispatch's buffer-size multiset contains every size in a fingerprint.
+// Multiplicity matters: the same size bound twice is not the same as once.
+function containsAll(buffers, sizes) {
+  const counts = new Map();
+  for (const size of buffers) counts.set(size, (counts.get(size) ?? 0) + 1);
+  for (const size of sizes) {
+    const left = (counts.get(size) ?? 0) - 1;
+    if (left < 0) return false;
+    counts.set(size, left);
+  }
+  return true;
+}
+
+function stats(values) {
+  const clean = values.filter((value) => Number.isFinite(value));
+  if (!clean.length) return null;
+  return {
+    min: Math.min(...clean),
+    median: median(clean),
+    max: Math.max(...clean),
+    samples: clean.length,
+  };
+}
+
+function productOf(values) {
+  if (!Array.isArray(values) || !values.length) return null;
+  let product = 1;
+  for (const value of values) product *= value ?? 1;
+  return product;
+}
+
+// One byte size can cover more than one shape. The graph is not available at
+// runtime, but the launched workgroup count is, so it completes the identity.
+function classKey(bytes, workgroups) {
+  return `${bytes}:${workgroups ?? 'unknown'}`;
+}
+
+function matchFingerprintBytes(buffers, known) {
+  const matches = known.filter((entry) => containsAll(buffers, entry.sizes));
+  const byteOptions = [...new Set(matches.map((entry) => entry.bytes))];
+  if (byteOptions.length === 1) return { bytes: byteOptions[0], ambiguous: false };
+  return { bytes: null, ambiguous: byteOptions.length > 1 };
+}
+
 // Gate 8: how effective bandwidth varies with the bytes one dispatch reads.
 //
 // A split-pass segment carries the sizes of the storage buffers its bind
 // groups referenced. A size that exactly matches one known weight initializer
 // identifies the weight; zero or several matches stay unattributed, because a
 // guess would defeat the point of the measurement.
+//
+// Gate 9 adds the launched workgroup count and the shader's workgroup size to
+// the same rows. Together they estimate the number of invocations, which is
+// the observable that separates "too little parallelism" from "memory bound".
 export function attributeMatmuls(
   profile,
   { opKey = 'op:MatMulNBits', fingerprints = [] } = {},
@@ -579,17 +627,8 @@ export function attributeMatmuls(
   let unmatchedSegments = 0;
   let ambiguousSegments = 0;
   let invalidSegments = 0;
-
-  const containsAll = (buffers, sizes) => {
-    const counts = new Map();
-    for (const size of buffers) counts.set(size, (counts.get(size) ?? 0) + 1);
-    for (const size of sizes) {
-      const left = (counts.get(size) ?? 0) - 1;
-      if (left < 0) return false;
-      counts.set(size, left);
-    }
-    return true;
-  };
+  let matchedSegments = 0;
+  let workgroupSegments = 0;
 
   for (const run of runs) {
     for (const segment of run.segments ?? []) {
@@ -611,24 +650,38 @@ export function attributeMatmuls(
       }
 
       const buffers = segment.buffers ?? [];
-      const matches = known.filter((entry) => containsAll(buffers, entry.sizes));
-      const byteOptions = [...new Set(matches.map((entry) => entry.bytes))];
-      if (byteOptions.length === 0) {
-        unmatchedSegments += 1;
-        continue;
-      }
-      if (byteOptions.length > 1) {
-        ambiguousSegments += 1;
+      const match = matchFingerprintBytes(buffers, known);
+      if (match.bytes == null) {
+        if (match.ambiguous) ambiguousSegments += 1;
+        else unmatchedSegments += 1;
         continue;
       }
 
-      const bytes = byteOptions[0];
-      const entry = classes.get(bytes) ?? { bytes, us: 0, dispatches: 0 };
+      const bytes = match.bytes;
+      const groups = productOf(segment.workgroups);
+      const workgroupSize = productOf(segment.workgroupSize);
+      const key = classKey(bytes, groups);
+      const entry = classes.get(key) ?? {
+        bytes,
+        workgroups: groups,
+        us: 0,
+        dispatches: 0,
+        groupSamples: [],
+        invocations: [],
+      };
       entry.us += us;
       entry.dispatches += count;
-      classes.set(bytes, entry);
+
+      if (groups != null) {
+        entry.groupSamples.push(groups);
+        workgroupSegments += 1;
+        if (workgroupSize != null) entry.invocations.push(groups * workgroupSize);
+      }
+
+      classes.set(key, entry);
       matchedUs += us;
       matchedDispatches += count;
+      matchedSegments += 1;
     }
   }
 
@@ -637,7 +690,9 @@ export function attributeMatmuls(
       const usPerStep = entry.us / stepCount;
       const dispatchesPerStep = entry.dispatches / stepCount;
       return {
+        key: classKey(entry.bytes, entry.workgroups),
         bytes: entry.bytes,
+        workgroups: entry.workgroups,
         dispatchesPerStep,
         usPerStep,
         gbps:
@@ -645,6 +700,8 @@ export function attributeMatmuls(
             ? (entry.bytes * dispatchesPerStep) / (usPerStep * 1000)
             : null,
         shareOfMatmul: totalUs ? entry.us / totalUs : null,
+        workgroupStats: stats(entry.groupSamples),
+        invocationStats: stats(entry.invocations),
       };
     })
     .sort((a, b) => b.usPerStep - a.usPerStep);
@@ -657,8 +714,233 @@ export function attributeMatmuls(
     dispatchesPerStep: dispatches / stepCount,
     matchedDispatchesPerStep: matchedDispatches / stepCount,
     coverage: totalUs ? matchedUs / totalUs : null,
+    workgroupCoverage: matchedSegments ? workgroupSegments / matchedSegments : null,
     unmatchedSegments,
     ambiguousSegments,
     invalidSegments,
+  };
+}
+
+// Gate 9: compare the two encodings on the same recorded dispatch.
+//
+// Each replay class carries a total for N dispatches inside one pass and the
+// per-pass times for N separate passes. The batched per-dispatch cost is the
+// slope between the two largest counts, so fixed pass setup cancels. The split
+// cost is the total of N passes divided by N; a median single pass would hide
+// the slow tail that is still paid. The ratio is only an encoding correction
+// where both encodings keep the weight cache-resident; decideEncodings uses
+// the absolute difference for that reason.
+export function compareEncodings(replay, { fingerprints = [] } = {}) {
+  const classes = replay?.classes ?? [];
+  if (!classes.length) throw new Error('compareEncodings: no replay classes');
+
+  const known = fingerprints.filter(
+    (entry) => Array.isArray(entry?.sizes) && entry.sizes.length > 0,
+  );
+  if (!known.length) throw new Error('compareEncodings: no known weight fingerprints');
+
+  let unmatchedClasses = 0;
+  let totalDispatches = 0;
+  let matchedDispatches = 0;
+
+  const rows = [];
+  for (const entry of classes) {
+    totalDispatches += entry.dispatches ?? 0;
+    const buffers = entry.buffers ?? [];
+    const match = matchFingerprintBytes(buffers, known);
+    if (match.bytes == null) {
+      unmatchedClasses += 1;
+      continue;
+    }
+
+    const batched = [...(entry.batched ?? [])].sort((a, b) => a.count - b.count);
+    const split = [...(entry.split ?? [])].sort((a, b) => a.count - b.count);
+    if (batched.length < 2) {
+      unmatchedClasses += 1;
+      continue;
+    }
+
+    const last = batched[batched.length - 1];
+    const previous = batched[batched.length - 2];
+    const batchedUsPerDispatch =
+      (last.medianUs - previous.medianUs) / (last.count - previous.count);
+    // Compare like with like: the batched number is a mean per dispatch over
+    // N dispatches, so the split number is the total of N passes over N. A
+    // median single pass would hide the slow tail that is still paid.
+    const splitLast = split[split.length - 1] ?? null;
+    const splitUsPerDispatch =
+      splitLast && splitLast.count > 0 ? splitLast.medianUs / splitLast.count : null;
+    if (!(batchedUsPerDispatch > 0) || !(splitUsPerDispatch > 0)) {
+      unmatchedClasses += 1;
+      continue;
+    }
+
+    const bytes = match.bytes;
+    const groups = productOf(entry.workgroups);
+    const workgroupSize = productOf(entry.workgroupSize);
+    rows.push({
+      key: classKey(bytes, groups),
+      bytes,
+      dispatches: entry.dispatches ?? null,
+      workgroups: groups,
+      invocations:
+        groups != null && workgroupSize != null ? groups * workgroupSize : null,
+      batchedUsPerDispatch,
+      splitUsPerDispatch,
+      splitToBatched: splitUsPerDispatch / batchedUsPerDispatch,
+      batchedGbps: bytes / (batchedUsPerDispatch * 1000),
+      splitGbps: bytes / (splitUsPerDispatch * 1000),
+    });
+    matchedDispatches += entry.dispatches ?? 0;
+  }
+
+  rows.sort((a, b) => a.bytes - b.bytes);
+  return {
+    rows,
+    unmatchedClasses,
+    coverage: totalDispatches ? matchedDispatches / totalDispatches : null,
+  };
+}
+
+// Gate 9 decision arithmetic. Kept in the pure seam so the units, the join and
+// the pre-registered 10% bar are testable without a browser.
+//
+// The replay repeats one weight, so it is cache-resident after the first copy.
+// For a weight larger than cache, split and batched then differ in cache state
+// as well as in encoding; the ratio is not a clean pass-boundary measurement.
+// Only classes whose weight stays cache-resident in both encodings (<
+// smallClassBytes) estimate the per-dispatch encoding cost, as an absolute
+// number of microseconds, and that estimate is subtracted from every class.
+export function decideEncodings(
+  { attribution, encodings, tokenMs },
+  {
+    smallClassBytes = 2 * 1024 * 1024,
+    practicalCeilingGbps = 86.18,
+    minShare = 0.1,
+  } = {},
+) {
+  if (!attribution?.classes?.length) {
+    throw new Error('decideEncodings: no attribution rows');
+  }
+  if (!encodings?.rows?.length) {
+    throw new Error('decideEncodings: no encoding rows');
+  }
+  assertPositive(tokenMs, 'tokenMs');
+
+  const byKey = new Map(encodings.rows.map((row) => [row.key, row]));
+  const unmatchedKeys = [];
+  const joined = [];
+  for (const row of attribution.classes) {
+    const encoding = byKey.get(row.key);
+    if (!encoding || !(row.dispatchesPerStep > 0)) {
+      unmatchedKeys.push(row.key);
+      continue;
+    }
+    joined.push({
+      row,
+      encoding,
+      coldUsPerDispatch: row.usPerStep / row.dispatchesPerStep,
+    });
+  }
+  if (!joined.length) throw new Error('decideEncodings: no rows joined');
+
+  const overheadSamples = joined
+    .filter(({ row }) => row.bytes < smallClassBytes)
+    .map(
+      ({ encoding }) =>
+        encoding.splitUsPerDispatch - encoding.batchedUsPerDispatch,
+    )
+    .filter((value) => value > 0);
+  const passOverheadUs = median(overheadSamples) ?? 0;
+
+  const rows = joined.map(({ row, encoding, coldUsPerDispatch }) => {
+    const correctedUsPerDispatch = Math.max(
+      0,
+      coldUsPerDispatch - passOverheadUs,
+    );
+    return {
+      key: row.key,
+      bytes: row.bytes,
+      workgroups: row.workgroups,
+      invocations: row.invocationStats?.median ?? null,
+      dispatchesPerStep: row.dispatchesPerStep,
+      coldUsPerDispatch,
+      correctedUsPerDispatch,
+      coldGbps:
+        coldUsPerDispatch > 0 ? row.bytes / (coldUsPerDispatch * 1000) : null,
+      correctedGbps:
+        correctedUsPerDispatch > 0
+          ? row.bytes / (correctedUsPerDispatch * 1000)
+          : null,
+      splitUsPerDispatch: encoding.splitUsPerDispatch,
+      batchedUsPerDispatch: encoding.batchedUsPerDispatch,
+      splitToBatched: encoding.splitToBatched,
+    };
+  });
+
+  const large = rows.filter((row) => row.bytes >= smallClassBytes);
+  const small = rows.filter((row) => row.bytes < smallClassBytes);
+  const largeGbps = large
+    .map((row) => row.coldGbps)
+    .filter((value) => Number.isFinite(value));
+  const referenceGbps = median(largeGbps);
+  const bestGbps = largeGbps.length ? Math.max(...largeGbps) : null;
+
+  const bytesPerStep = (group) =>
+    group.reduce((total, row) => total + row.bytes * row.dispatchesPerStep, 0);
+  const timeOf = (group) =>
+    group.reduce(
+      (total, row) => total + row.correctedUsPerDispatch * row.dispatchesPerStep,
+      0,
+    ) / 1000;
+  // bytes / (GB/s * 1e6) = ms: one GB/s is 1e9 B/s, and ms adds 1e3.
+  const idealMs = (group, gbps) => bytesPerStep(group) / (gbps * 1e6);
+
+  const smallIdealMs = referenceGbps ? idealMs(small, referenceGbps) : null;
+  const smallCorrectedMs = timeOf(small);
+  const largeIdealMs = idealMs(large, practicalCeilingGbps);
+  const largeIdealRunBestMs = bestGbps ? idealMs(large, bestGbps) : null;
+  const largeCorrectedMs = timeOf(large);
+
+  const smallHeadroomMs =
+    smallIdealMs == null ? null : smallCorrectedMs - smallIdealMs;
+  const largeHeadroomMs = largeCorrectedMs - largeIdealMs;
+  const largeHeadroomRunBestMs =
+    largeIdealRunBestMs == null ? null : largeCorrectedMs - largeIdealRunBestMs;
+  const ratios = rows.map((row) => row.splitToBatched);
+
+  return {
+    tokenMs,
+    passOverheadUs,
+    referenceGbps,
+    bestGbps,
+    practicalCeilingGbps,
+    minShare,
+    rows,
+    unmatchedKeys,
+    small: {
+      classes: small.length,
+      bytesPerStep: bytesPerStep(small),
+      correctedMs: smallCorrectedMs,
+      idealMs: smallIdealMs,
+      headroomMs: smallHeadroomMs,
+      share: smallHeadroomMs == null ? null : smallHeadroomMs / tokenMs,
+    },
+    large: {
+      classes: large.length,
+      bytesPerStep: bytesPerStep(large),
+      correctedMs: largeCorrectedMs,
+      idealMs: largeIdealMs,
+      headroomMs: largeHeadroomMs,
+      share: largeHeadroomMs / tokenMs,
+      idealRunBestMs: largeIdealRunBestMs,
+      headroomRunBestMs: largeHeadroomRunBestMs,
+      shareRunBest:
+        largeHeadroomRunBestMs == null ? null : largeHeadroomRunBestMs / tokenMs,
+    },
+    splitRatios: {
+      median: median(ratios),
+      max: ratios.length ? Math.max(...ratios) : null,
+    },
   };
 }

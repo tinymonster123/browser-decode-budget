@@ -11,7 +11,6 @@
 //
 // Env: MODELS=base STEPS=4 HEADLESS=1 PORT=8129 OUT=... WEIGHTS=...
 
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { attributeMatmuls } from '../analysis/ledger.mjs';
@@ -21,6 +20,7 @@ import {
   envNumber,
   envText,
   fmt,
+  knownFingerprints,
   ledgerPath,
   root,
   runDriver,
@@ -41,17 +41,6 @@ const WEIGHTS = envText(
   'WEIGHTS',
   join(root, 'runs/2026-10-20-exp7-weight-bytes-by-op.json'),
 );
-
-function knownFingerprints(path, opType) {
-  const ledger = JSON.parse(readFileSync(path, 'utf8'));
-  const fingerprints = ledger?.fingerprints;
-  if (fingerprints?.opType !== opType || !Array.isArray(fingerprints.entries)) {
-    throw new Error(
-      `${path} has no fingerprints for ${opType}; run "make weight-bytes"`,
-    );
-  }
-  return fingerprints.entries;
-}
 
 const FINGERPRINTS = knownFingerprints(WEIGHTS, 'MatMulNBits');
 

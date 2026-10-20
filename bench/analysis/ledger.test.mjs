@@ -23,6 +23,8 @@ import {
   combinePlateaus,
   attributeOps,
   attributeMatmuls,
+  compareEncodings,
+  decideEncodings,
 } from './ledger.mjs';
 
 function row(mode, count, wallMs, gpuMs = wallMs) {
@@ -730,4 +732,257 @@ test('attributeMatmuls: refuses a profile without known fingerprints', () => {
 
   assert.throws(() => attributeMatmuls(profile, { fingerprints: [] }), /no known weight fingerprints/);
   assert.throws(() => attributeMatmuls({ runs: [] }, { fingerprints: [{ sizes: [1], bytes: 1 }] }), /no usable decode steps/);
+});
+
+test('attributeMatmuls: workgroup count and invocations stay with the weight class', () => {
+  const profile = {
+    runs: [
+      {
+        step: 0,
+        segments: [
+          {
+            us: 20,
+            dispatches: 1,
+            pipelines: ['op:MatMulNBits'],
+            buffers: [1e6, 4096],
+            workgroups: [4, 1, 1],
+            workgroupSize: [64, 1, 1],
+          },
+          {
+            us: 10,
+            dispatches: 1,
+            pipelines: ['op:MatMulNBits'],
+            buffers: [1e6, 4096],
+            workgroups: [4, 1, 1],
+            workgroupSize: [64, 1, 1],
+          },
+          {
+            us: 5,
+            dispatches: 1,
+            pipelines: ['op:MatMulNBits'],
+            buffers: [2e6, 4096],
+            workgroups: [32, 1, 1],
+            workgroupSize: [64, 1, 1],
+          },
+          {
+            // Indirect dispatch: the count is not observable.
+            us: 5,
+            dispatches: 1,
+            pipelines: ['op:MatMulNBits'],
+            buffers: [2e6, 4096],
+            workgroups: null,
+          },
+        ],
+      },
+    ],
+  };
+  const fingerprints = [
+    { sizes: [1e6], bytes: 1e6, nodes: 1 },
+    { sizes: [2e6], bytes: 2e6, nodes: 1 },
+  ];
+
+  const out = attributeMatmuls(profile, { fingerprints });
+  const byKey = Object.fromEntries(out.classes.map((row) => [row.key, row]));
+
+  // One byte size, two shapes: the workgroup count keeps them apart.
+  assert.equal(byKey['1000000:4'].workgroupStats.median, 4);
+  assert.equal(byKey['1000000:4'].invocationStats.median, 256);
+  assert.equal(byKey['1000000:4'].workgroupStats.samples, 2);
+  assert.equal(byKey['2000000:32'].workgroupStats.median, 32);
+  assert.equal(byKey['2000000:32'].workgroupStats.samples, 1);
+  assert.equal(byKey['2000000:unknown'].workgroups, null);
+  assert.equal(out.workgroupCoverage, 0.75);
+});
+
+test('compareEncodings: batched slope, split total per dispatch and their ratio', () => {
+  const replay = {
+    classes: [
+      {
+        buffers: [1e6, 4096],
+        dispatches: 10,
+        workgroups: [4, 1, 1],
+        workgroupSize: [64, 1, 1],
+        batched: [
+          { count: 1, medianUs: 30 },
+          { count: 4, medianUs: 100 },
+          { count: 16, medianUs: 280 },
+          { count: 64, medianUs: 760 },
+        ],
+        split: [
+          { count: 1, medianUs: 15 },
+          { count: 4, medianUs: 60 },
+        ],
+      },
+      {
+        // No fingerprint match: reported as unmatched, not guessed.
+        buffers: [777, 4096],
+        dispatches: 2,
+        workgroups: [1, 1, 1],
+        workgroupSize: [64, 1, 1],
+        batched: [
+          { count: 1, medianUs: 2 },
+          { count: 4, medianUs: 4 },
+        ],
+        split: [],
+      },
+    ],
+  };
+  const fingerprints = [{ sizes: [1e6], bytes: 1e6, nodes: 1 }];
+
+  const out = compareEncodings(replay, { fingerprints });
+  const [row] = out.rows;
+
+  assert.equal(row.bytes, 1e6);
+  assert.equal(row.batchedUsPerDispatch, 10);
+  assert.equal(row.splitUsPerDispatch, 15);
+  assert.equal(row.splitToBatched, 1.5);
+  assert.equal(row.batchedGbps, 100);
+  assert.equal(row.workgroups, 4);
+  assert.equal(row.invocations, 256);
+  assert.equal(out.unmatchedClasses, 1);
+  assert.equal(out.coverage, 10 / 12);
+});
+
+test('compareEncodings: a class without split samples is not compared', () => {
+  const replay = {
+    classes: [
+      {
+        buffers: [1e6],
+        dispatches: 1,
+        batched: [
+          { count: 1, medianUs: 5 },
+          { count: 4, medianUs: 9 },
+        ],
+        split: [],
+      },
+    ],
+  };
+
+  const out = compareEncodings(replay, {
+    fingerprints: [{ sizes: [1e6], bytes: 1e6 }],
+  });
+
+  assert.equal(out.rows.length, 0);
+  assert.equal(out.unmatchedClasses, 1);
+  assert.equal(out.coverage, 0);
+});
+
+test('compareEncodings: refuses an empty replay or missing fingerprints', () => {
+  assert.throws(
+    () => compareEncodings({ classes: [] }, { fingerprints: [{ sizes: [1] }] }),
+    /no replay classes/,
+  );
+  assert.throws(
+    () => compareEncodings({ classes: [{}] }, { fingerprints: [] }),
+    /no known weight fingerprints/,
+  );
+});
+
+function decisionInput({ smallSplit = 8, smallBatch = 6, largeSplit = 150, largeBatch = 140 } = {}) {
+  return {
+    tokenMs: 100,
+    attribution: {
+      classes: [
+        {
+          key: '1e6:32',
+          bytes: 1e6,
+          workgroups: 32,
+          invocationStats: { median: 4096 },
+          dispatchesPerStep: 10,
+          usPerStep: 200,
+        },
+        {
+          key: '1e7:192',
+          bytes: 1e7,
+          workgroups: 192,
+          invocationStats: { median: 24576 },
+          dispatchesPerStep: 1,
+          usPerStep: 150,
+        },
+      ],
+    },
+    encodings: {
+      rows: [
+        {
+          key: '1e6:32',
+          bytes: 1e6,
+          workgroups: 32,
+          splitUsPerDispatch: smallSplit,
+          batchedUsPerDispatch: smallBatch,
+          splitToBatched: smallSplit / smallBatch,
+        },
+        {
+          key: '1e7:192',
+          bytes: 1e7,
+          workgroups: 192,
+          splitUsPerDispatch: largeSplit,
+          batchedUsPerDispatch: largeBatch,
+          splitToBatched: largeSplit / largeBatch,
+        },
+      ],
+    },
+  };
+}
+
+test('decideEncodings: per-dispatch overhead, corrected time and the ideal ms', () => {
+  const out = decideEncodings(decisionInput(), {
+    smallClassBytes: 2e6,
+    practicalCeilingGbps: 100,
+    minShare: 0.1,
+  });
+  const byKey = Object.fromEntries(out.rows.map((row) => [row.key, row]));
+
+  // Only the cache-resident small class estimates the encoding cost.
+  assert.equal(out.passOverheadUs, 2);
+  assert.equal(byKey['1e6:32'].coldUsPerDispatch, 20);
+  assert.equal(byKey['1e6:32'].correctedUsPerDispatch, 18);
+  assert.equal(byKey['1e7:192'].correctedUsPerDispatch, 148);
+  assert.equal(byKey['1e6:32'].invocations, 4096);
+  assert.equal(byKey['1e7:192'].invocations, 24576);
+  assert.ok(Math.abs(byKey['1e6:32'].correctedGbps - 1e6 / (18 * 1000)) < 1e-9);
+
+  assert.equal(out.small.correctedMs, 0.18);
+  assert.equal(out.large.correctedMs, 0.148);
+  assert.equal(out.large.idealMs, 0.1);
+  assert.ok(Math.abs(out.large.headroomMs - 0.048) < 1e-12);
+  assert.ok(Math.abs(out.large.share - 0.00048) < 1e-12);
+  assert.ok(Math.abs(out.referenceGbps - 1e7 / (150 * 1000)) < 1e-9);
+  assert.deepEqual(out.unmatchedKeys, []);
+});
+
+test('decideEncodings: a large-class replay difference does not set the overhead', () => {
+  // The large class differs by 50 µs only because its weight is cache-hot in
+  // the replay; it must not inflate the pass-boundary estimate.
+  const out = decideEncodings(
+    decisionInput({ largeSplit: 200, largeBatch: 150 }),
+    { smallClassBytes: 2e6, practicalCeilingGbps: 100 },
+  );
+
+  assert.equal(out.passOverheadUs, 2);
+});
+
+test('decideEncodings: an unmatched class is reported, not silently dropped', () => {
+  const input = decisionInput();
+  input.encodings.rows.pop();
+
+  const out = decideEncodings(input, { smallClassBytes: 2e6, practicalCeilingGbps: 100 });
+
+  assert.deepEqual(out.unmatchedKeys, ['1e7:192']);
+  assert.equal(out.rows.length, 1);
+  assert.equal(out.large.classes, 0);
+});
+
+test('decideEncodings: refuses missing rows or a non-positive token time', () => {
+  assert.throws(
+    () => decideEncodings({ attribution: { classes: [] }, encodings: { rows: [{}] }, tokenMs: 1 }),
+    /no attribution rows/,
+  );
+  assert.throws(
+    () => decideEncodings({ attribution: { classes: [{}] }, encodings: { rows: [] }, tokenMs: 1 }),
+    /no encoding rows/,
+  );
+  assert.throws(
+    () => decideEncodings({ ...decisionInput(), tokenMs: 0 }),
+    /tokenMs/,
+  );
 });

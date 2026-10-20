@@ -4,8 +4,11 @@
 这个问题开始；Gate 6 用实测负结果关闭了这条路线（tag `gate6-closed`）。
 Gate 7 把 27.2 ms 按 op class 拆开：**71–75% 是 q4 矩阵乘，其余 kernel 25–29%**。
 Gate 8 再按权重字节拆：**带宽随权重变小而下降**，0.22 MiB 的 k_proj 只有
-10.7–15.2 GB/s，把 matmul 的平均值拉到 62 GB/s。现在的问题是小 kernel 的
-并行度，而不是图结构。
+10.7–15.2 GB/s，把 matmul 的平均值拉到 62 GB/s。
+Gate 9 修正了这个读法：同一个字节数混合了不同形状；按
+`(字节, workgroup)` 拆开后，两个候选（小 kernel 并行度、大 kernel 带宽）
+的**上界都低于 10%**，优化线到此关闭。每次 dispatch 有
+**12.4–13.1 µs 固定成本**（两轮拟合范围），小 kernel 的慢主要是摊不薄它。
 
 从 `gemma-translate` 的 decode 实验中抽出。那边看到的是 29.9 ms/token；本项目
 先证伪了「瓶颈在每算子 dispatch」这个假设，再转向成本归因。
@@ -23,6 +26,7 @@ Gate 8 再按权重字节拆：**带宽随权重变小而下降**，0.22 MiB 的
 | **6** | 还有没有 ≥10% 的路线？ | ❌ 2026-10-20 | **三条路线全关，无 frontier ticket**；见 `gate6-closed` |
 | **7** | 27 ms 按 op class 怎么分？ | ✅ 2026-10-20 | **MatMulNBits 71–75%**；其余所有 kernel 合计 25–29% |
 | **8** | 242 次 matmul 效率为什么不同？ | ✅ 2026-10-20 | 带宽随权重字节下降：0.22 MiB 的 k_proj 只有 **10.7–15.2 GB/s** |
+| **9** | 哪个缺口是真的？ | ❌ 2026-10-20 | **两个候选都 <10%，优化线关闭**；每次 dispatch 固定成本 **12.4–13.1 µs** |
 
 Gate 0 的完整报告见 [`docs/experiments/2026-10-19-gate0-census.md`](docs/experiments/2026-10-19-gate0-census.md)，
 Gate 1 见 [`docs/experiments/2026-10-19-gate1-manual-fusion.md`](docs/experiments/2026-10-19-gate1-manual-fusion.md)，
@@ -277,6 +281,42 @@ buffer 多重集包含哪个指纹，就归到哪个权重档位。
 **1.70–2.27 ms（token 的 6.3–8.4%）**——推论，不是已选路线。
 详见 [`docs/experiments/2026-10-20-gate8-matmul-efficiency.md`](docs/experiments/2026-10-20-gate8-matmul-efficiency.md)。
 
+## Gate 9 结果（负结果）：两个候选都不到 10%
+
+Gate 9 先修正了 Gate 8 的一个读法：**权重字节数不是 kernel 身份**。
+同样 227,328 B 的档位里有 59 个 `[256,48,16]`（k/v/input_gate）和
+35 个 `[1536,8,16]`（per-layer projection），运行时 workgroup 数是 32 vs 192。
+按 `(字节, workgroup)` 重新分组后逐档重算。
+
+一 dispatch 一 pass 的代价直接测到了：重放同一个 dispatch，split 比 batched
+每次多 **1.0–1.3 µs**（两次运行一致）。对最小的 kernel（冷时间 12–23 µs）
+是 4–11%，低于 15% 的修正阈值。
+
+workgroup=192 这一族覆盖 0.22 / 1.73 / 3.47 / 5.20 / 10.41 MiB 五个真实形状，
+拟合出下面这个式子（**推论，不是实测**；两轮范围）：
+
+```
+每次 dispatch 时间 ≈ 12.4–13.1 µs 固定成本 + 权重字节 / (79–85 GB/s)
+```
+
+| 候选 | 上界（两次运行） | 判定 |
+|---|---:|---|
+| A. 小档位并行度 / 固定成本 | **5.4% / 8.8% token** | 低于 10% |
+| A（敏感性：同轮最好档位） | 6.7% / 9.6% | 低于 10% |
+| B. 大档位内存效率（到同轮最好档位） | **6.6% / 6.0% token** | 低于 10% |
+| B（跨负载用 Gate 5 的 86.18 GB/s） | 6.1% / 12.0% | 高负载轮不可比 |
+| B（只在纯读上限 109 GB/s 下） | 16.8–22.7% | 没有实测 kernel 达到过 |
+
+两轮运行的 loadavg 是 **2.96 / 4.70**，MatMulNBits 合计
+**19.02 / 21.64 ms/step**、整体 **69.3 / 60.9 GB/s**。Gate 7 的
+17.76–18.10 ms（loadavg 2.72–3.48）和 Gate 8 的 21.3–21.5 ms
+（loadavg 5.0–5.9）都落在这条负载线上，跨负载不可比。
+
+**结论：不进入优化 gate。** 小档位固定成本最多 **1.9–2.0 ms**，
+大档位距同轮最好档位约 **1.6–1.8 ms**，都低于 10%，且都需要换 kernel
+或换运行时。
+详见 [`docs/experiments/2026-10-20-gate9-discrimination.md`](docs/experiments/2026-10-20-gate9-discrimination.md)。
+
 ## 目录
 
 ```text
@@ -315,6 +355,7 @@ make bench-prepare         # 准备浏览器 runtime 资产
 make bench                 # Chrome + WebGPU：默认 base vs gate2
 make bench-op-attribution  # Gate 7：一 dispatch 一 pass，按 op class 归因
 make bench-matmul-efficiency  # Gate 8：按权重字节看 matmul 的有效带宽
+make bench-gate9            # Gate 9：workgroup 数 + split/batched 重放
 ```
 
 默认读取 `~/Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX`。
@@ -370,6 +411,10 @@ models/derived/<artifact-id>/
 - **Gate 8 — matmul 效率（已完成）**：按权重指纹归因，带宽随权重字节数下降；
   94 次 0.22 MiB k_proj 只有 10.7–15.2 GB/s。下一步的问题是「小 matmul 是不是
   并行度受限」，而不是「总体带宽不够」。
+- **Gate 9 — 判别（已完成，负结果）**：同一字节数混合了不同形状，按
+  `(字节, workgroup)` 重新分组；split-pass 直接测得约 **1 µs/dispatch**；
+  每次 dispatch 有 **12.4–13.1 µs 固定成本**。小档位和大档位两个候选的上界
+  都低于 10%，优化线关闭。
 
 ## 非目标
 
