@@ -1,0 +1,49 @@
+{
+  "name": "gate1",
+  "model": "models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f16.onnx",
+  "node": "/lm_head/MatMul_Quant",
+  "inputs": [
+    "/lm_head/num_logits_to_keep/Slice/output_0",
+    "lm_head_MatMul_weight_quant",
+    "lm_head_MatMul_weight_scales",
+    "lm_head_MatMul_weight_zp"
+  ],
+  "outputs": [
+    "/lm_head/MatMul/output_0"
+  ],
+  "tensors": [
+    {
+      "name": "lm_head_MatMul_weight_quant",
+      "dims": [
+        262144,
+        48,
+        16
+      ],
+      "dataType": 2,
+      "dataTypeName": "UINT8",
+      "bytes": 201326592
+    },
+    {
+      "name": "lm_head_MatMul_weight_scales",
+      "dims": [
+        262144,
+        48
+      ],
+      "dataType": 10,
+      "dataTypeName": "FLOAT16",
+      "bytes": 25165824
+    },
+    {
+      "name": "lm_head_MatMul_weight_zp",
+      "dims": [
+        262144,
+        24
+      ],
+      "dataType": 2,
+      "dataTypeName": "UINT8",
+      "bytes": 6291456
+    }
+  ],
+  "totalBytes": 232783872,
+  "selection": "named"
+}

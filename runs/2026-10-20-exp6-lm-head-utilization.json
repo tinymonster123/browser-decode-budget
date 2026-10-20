@@ -1,0 +1,224 @@
+{
+  "timestamp": "2026-10-20T05:08:10.028Z",
+  "commit": "2c82190",
+  "loadavg": [
+    2.36,
+    2.22,
+    2.73
+  ],
+  "config": {
+    "profile": "/Users/fenghanli/Projects/fused-onnx/runs/2026-10-19-exp4-pass-profile.json",
+    "bandwidth": "/Users/fenghanli/Projects/fused-onnx/runs/2026-10-20-exp6-bandwidth.json",
+    "weights": [
+      "/Users/fenghanli/Projects/fused-onnx/runs/2026-10-20-lm-head-weights.json",
+      "/Users/fenghanli/Projects/fused-onnx/runs/2026-10-20-lm-head-weights-gate1.json",
+      "/Users/fenghanli/Projects/fused-onnx/runs/2026-10-20-lm-head-weights-gate2.json"
+    ]
+  },
+  "inputs": {
+    "ceilingGbps": 109.05858267587425,
+    "fromBytes": 8388608,
+    "weights": [
+      {
+        "model": "base",
+        "bytes": 232783872,
+        "node": "/lm_head/MatMul_Quant",
+        "selection": "named",
+        "tensors": [
+          {
+            "name": "lm_head_MatMul_weight_quant",
+            "dims": [
+              262144,
+              48,
+              16
+            ],
+            "dataType": 2,
+            "dataTypeName": "UINT8",
+            "bytes": 201326592
+          },
+          {
+            "name": "lm_head_MatMul_weight_scales",
+            "dims": [
+              262144,
+              48
+            ],
+            "dataType": 10,
+            "dataTypeName": "FLOAT16",
+            "bytes": 25165824
+          },
+          {
+            "name": "lm_head_MatMul_weight_zp",
+            "dims": [
+              262144,
+              24
+            ],
+            "dataType": 2,
+            "dataTypeName": "UINT8",
+            "bytes": 6291456
+          }
+        ]
+      },
+      {
+        "model": "gate1",
+        "bytes": 232783872,
+        "node": "/lm_head/MatMul_Quant",
+        "selection": "named",
+        "tensors": [
+          {
+            "name": "lm_head_MatMul_weight_quant",
+            "dims": [
+              262144,
+              48,
+              16
+            ],
+            "dataType": 2,
+            "dataTypeName": "UINT8",
+            "bytes": 201326592
+          },
+          {
+            "name": "lm_head_MatMul_weight_scales",
+            "dims": [
+              262144,
+              48
+            ],
+            "dataType": 10,
+            "dataTypeName": "FLOAT16",
+            "bytes": 25165824
+          },
+          {
+            "name": "lm_head_MatMul_weight_zp",
+            "dims": [
+              262144,
+              24
+            ],
+            "dataType": 2,
+            "dataTypeName": "UINT8",
+            "bytes": 6291456
+          }
+        ]
+      },
+      {
+        "model": "gate2",
+        "bytes": 232783872,
+        "node": "/lm_head/MatMul_Quant",
+        "selection": "named",
+        "tensors": [
+          {
+            "name": "lm_head_MatMul_weight_quant",
+            "dims": [
+              262144,
+              48,
+              16
+            ],
+            "dataType": 2,
+            "dataTypeName": "UINT8",
+            "bytes": 201326592
+          },
+          {
+            "name": "lm_head_MatMul_weight_scales",
+            "dims": [
+              262144,
+              48
+            ],
+            "dataType": 10,
+            "dataTypeName": "FLOAT16",
+            "bytes": 25165824
+          },
+          {
+            "name": "lm_head_MatMul_weight_zp",
+            "dims": [
+              262144,
+              24
+            ],
+            "dataType": 2,
+            "dataTypeName": "UINT8",
+            "bytes": 6291456
+          }
+        ]
+      }
+    ]
+  },
+  "results": [
+    {
+      "model": "base",
+      "medianUs": 2701.292,
+      "bytes": 232783872,
+      "steps": [
+        {
+          "step": 0,
+          "index": 263,
+          "us": 2634.502,
+          "dispatches": 1
+        },
+        {
+          "step": 1,
+          "index": 263,
+          "us": 2701.292,
+          "dispatches": 1
+        },
+        {
+          "step": 2,
+          "index": 263,
+          "us": 3647.36,
+          "dispatches": 1
+        }
+      ],
+      "gbps": 86.17501254955037,
+      "percent": 79.01717630575247
+    },
+    {
+      "model": "gate1",
+      "medianUs": 2594.543,
+      "bytes": 232783872,
+      "steps": [
+        {
+          "step": 0,
+          "index": 234,
+          "us": 2592.46,
+          "dispatches": 1
+        },
+        {
+          "step": 1,
+          "index": 235,
+          "us": 5286.628,
+          "dispatches": 1
+        },
+        {
+          "step": 2,
+          "index": 235,
+          "us": 2594.543,
+          "dispatches": 1
+        }
+      ],
+      "gbps": 89.72056813088085,
+      "percent": 82.26823229266914
+    },
+    {
+      "model": "gate2",
+      "medianUs": 2595.835,
+      "bytes": 232783872,
+      "steps": [
+        {
+          "step": 0,
+          "index": 205,
+          "us": 5956.326,
+          "dispatches": 1
+        },
+        {
+          "step": 1,
+          "index": 211,
+          "us": 2595.835,
+          "dispatches": 1
+        },
+        {
+          "step": 2,
+          "index": 211,
+          "us": 2592.085,
+          "dispatches": 1
+        }
+      ],
+      "gbps": 89.67591237501613,
+      "percent": 82.2272857162796
+    }
+  ]
+}

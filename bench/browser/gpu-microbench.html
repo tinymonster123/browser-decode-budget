@@ -79,13 +79,30 @@
         return clean.length ? Math.min(...clean) : null;
       }
 
+      // Flip the sweep order every repeat so neither sweep systematically
+      // inherits the state left by the other.
+      function sweepOrder(repeat, sweeps) {
+        return repeat % 2 === 1
+          ? Array.from({ length: sweeps }, (_, i) => sweeps - 1 - i)
+          : Array.from({ length: sweeps }, (_, i) => i);
+      }
+
       async function setup() {
         const adapter = await navigator.gpu.requestAdapter({
           powerPreference: 'high-performance',
         });
         if (!adapter) throw new Error('no WebGPU adapter');
         const info = adapter.info ?? adapter.adapterInfo ?? null;
-        const device = await adapter.requestDevice();
+        const timestampQuery = adapter.features?.has?.('timestamp-query') === true;
+        const device = await adapter.requestDevice({
+          ...(timestampQuery ? { requiredFeatures: ['timestamp-query'] } : {}),
+          // The default storage binding limit is 128 MiB; a bandwidth plateau
+          // needs buffers larger than that to rule out cache residency.
+          requiredLimits: {
+            maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+            maxBufferSize: adapter.limits.maxBufferSize,
+          },
+        });
         const module = device.createShaderModule({ code: SHADER });
         const pipeline = device.createComputePipeline({
           layout: 'auto',
@@ -100,7 +117,15 @@
           layout: bindGroupLayout,
           entries: [{ binding: 0, resource: { buffer } }],
         });
-        return { device, pipeline, bindGroup, bindGroupLayout, buffer, info };
+        return {
+          device,
+          pipeline,
+          bindGroup,
+          bindGroupLayout,
+          buffer,
+          info,
+          timestampQuery,
+        };
       }
 
       // One dispatch per pass, each pass reading and writing the same element.
@@ -255,6 +280,232 @@
         return { count, usPerCall: median(samples) * 1000, samples };
       }
 
+      // ---------------------------------------------------------------
+      // Bandwidth probe (Gate 6 #4)
+      // ---------------------------------------------------------------
+      // One read-only pass over a buffer. The loaded value feeds a sentinel
+      // comparison that can only be true for one value, so the read cannot be
+      // removed and the write traffic stays negligible.
+      const BANDWIDTH_WORKGROUP = 256;
+      const BANDWIDTH_SHADER = /* wgsl */ `
+        @group(0) @binding(0) var<storage, read> data: array<u32>;
+        @group(0) @binding(1) var<storage, read_write> sink: array<u32>;
+
+        @compute @workgroup_size(${BANDWIDTH_WORKGROUP})
+        fn main(
+          @builtin(global_invocation_id) gid: vec3<u32>,
+          @builtin(num_workgroups) groups: vec3<u32>,
+        ) {
+          let stride = ${BANDWIDTH_WORKGROUP}u * groups.x;
+          var i = gid.x;
+          while (i < arrayLength(&data)) {
+            let v = data[i];
+            if (v == 0xFFFFFFFFu) { sink[0] = v; }
+            i = i + stride;
+          }
+        }
+      `;
+
+      async function runBandwidthPass({
+        device,
+        pipeline,
+        bindGroup,
+        workgroups,
+        querySet,
+        resolveBuffer,
+        readBuffer,
+      }) {
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass({
+          timestampWrites: {
+            querySet,
+            beginningOfPassWriteIndex: 0,
+            endOfPassWriteIndex: 1,
+          },
+        });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(workgroups);
+        pass.end();
+        enc.resolveQuerySet(querySet, 0, 2, resolveBuffer, 0);
+        enc.copyBufferToBuffer(resolveBuffer, 0, readBuffer, 0, 16);
+        device.queue.submit([enc.finish()]);
+
+        await readBuffer.mapAsync(GPUMapMode.READ, 0, 16);
+        const view = new BigInt64Array(readBuffer.getMappedRange(0, 16));
+        const ns = Number(view[1] - view[0]);
+        readBuffer.unmap();
+        return ns;
+      }
+
+      function summarizeBandwidth({ bytes, samples }) {
+        const ns = samples.map((sample) => sample.ns);
+        const gbpsOf = (value) => (value > 0 ? bytes / value : null);
+        const p05Ns = percentile(ns, 0.05);
+        const medianNs = median(ns);
+        const minNs = minimum(ns);
+        return {
+          bytes,
+          samples,
+          p05Ns,
+          medianNs,
+          minNs,
+          p05Gbps: gbpsOf(p05Ns),
+          medianGbps: gbpsOf(medianNs),
+          minGbps: gbpsOf(minNs),
+        };
+      }
+
+      window.__bandwidth = async ({
+        sizesMb = [4, 8, 16, 32, 64, 128, 256],
+        repeats = 30,
+        sweeps = 2,
+      } = {}) => {
+        const result = {
+          info: null,
+          timestampQuery: false,
+          rows: [],
+          error: null,
+          stack: null,
+        };
+        try {
+          const { device, info, timestampQuery } = await setup();
+          result.info = info
+            ? {
+                vendor: info.vendor,
+                architecture: info.architecture,
+                device: info.device,
+                description: info.description,
+              }
+            : null;
+          result.timestampQuery = timestampQuery;
+
+          if (!timestampQuery) {
+            throw new Error(
+              'timestamp-query is not available; refusing to measure bandwidth',
+            );
+          }
+
+          const module = device.createShaderModule({ code: BANDWIDTH_SHADER });
+          const compilation = await module.getCompilationInfo?.();
+          const shaderErrors =
+            compilation?.messages?.filter((message) => message.type === 'error') ?? [];
+          if (shaderErrors.length) {
+            throw new Error(
+              `bandwidth shader: ${shaderErrors.map((m) => m.message).join('; ')}`,
+            );
+          }
+          const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' },
+          });
+          const layout = pipeline.getBindGroupLayout(0);
+
+          const sizes = sizesMb.map((mb) => mb * 1024 * 1024);
+          const resources = new Map();
+          for (const bytes of sizes) {
+            const data = device.createBuffer({
+              size: bytes,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            const sink = device.createBuffer({
+              size: 4,
+              usage:
+                GPUBufferUsage.STORAGE |
+                GPUBufferUsage.COPY_SRC |
+                GPUBufferUsage.COPY_DST,
+            });
+            const bindGroup = device.createBindGroup({
+              layout,
+              entries: [
+                { binding: 0, resource: { buffer: data } },
+                { binding: 1, resource: { buffer: sink } },
+              ],
+            });
+            const workgroups = Math.min(
+              65535,
+              Math.ceil(bytes / 4 / BANDWIDTH_WORKGROUP),
+            );
+            resources.set(bytes, { data, sink, bindGroup, workgroups });
+          }
+
+          const querySet = device.createQuerySet({ type: 'timestamp', count: 2 });
+          const resolveBuffer = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+          });
+          const readBuffer = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          });
+
+          const largest = sizes[sizes.length - 1];
+          const largestResource = resources.get(largest);
+
+          // Steady-state clock before any sample is recorded.
+          const warmUntil = performance.now() + 500;
+          while (performance.now() < warmUntil) {
+            await runBandwidthPass({
+              device,
+              pipeline,
+              querySet,
+              resolveBuffer,
+              readBuffer,
+              ...largestResource,
+            });
+          }
+
+          const samples = new Map();
+          for (let repeat = 0; repeat < repeats; repeat++) {
+            const order = sweepOrder(repeat, sweeps);
+            for (const sweep of order) {
+              for (const bytes of sizes) {
+                status(
+                  `bandwidth repeat ${repeat}/${repeats - 1} sweep ` +
+                    `${sweep}/${sweeps - 1} ${bytes / 1024 / 1024} MB…`,
+                );
+                const ns = await runBandwidthPass({
+                  device,
+                  pipeline,
+                  querySet,
+                  resolveBuffer,
+                  readBuffer,
+                  ...resources.get(bytes),
+                });
+                const key = `${sweep}:${bytes}`;
+                if (!samples.has(key)) samples.set(key, []);
+                samples.get(key).push({ ns, gbps: bytes / ns });
+              }
+            }
+          }
+
+          for (let sweep = 0; sweep < sweeps; sweep++) {
+            for (const bytes of sizes) {
+              result.rows.push({
+                ...summarizeBandwidth({
+                  bytes,
+                  samples: samples.get(`${sweep}:${bytes}`) ?? [],
+                }),
+                sweep,
+              });
+            }
+          }
+
+          for (const resource of resources.values()) {
+            resource.data.destroy();
+            resource.sink.destroy();
+          }
+          resolveBuffer.destroy();
+          readBuffer.destroy();
+          querySet.destroy?.();
+        } catch (error) {
+          result.error = String(error);
+          result.stack = error?.stack ?? null;
+        }
+        status(result.error ? `error: ${result.error}` : 'done');
+        return result;
+      };
+
       window.__microbench = async ({
         counts = [0, 1000, 2000, 4000, 8000],
         modes = ['one-pass', 'n-pass', 'dependent'],
@@ -309,9 +560,7 @@
           for (const mode of modes) {
             const samples = new Map();
             for (let repeat = 0; repeat < repeats; repeat++) {
-              const order = repeat % 2 === 1
-                ? Array.from({ length: sweeps }, (_, i) => sweeps - 1 - i)
-                : Array.from({ length: sweeps }, (_, i) => i);
+              const order = sweepOrder(repeat, sweeps);
               for (const sweep of order) {
                 for (const count of counts) {
                   status(

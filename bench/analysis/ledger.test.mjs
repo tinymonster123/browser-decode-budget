@@ -17,6 +17,10 @@ import {
   agreement,
   fusionCeiling,
   dispatchModeComparison,
+  requireTimestampQuery,
+  lmHeadPasses,
+  lmHeadUtilization,
+  combinePlateaus,
 } from './ledger.mjs';
 
 function row(mode, count, wallMs, gpuMs = wallMs) {
@@ -356,6 +360,146 @@ test('dispatch mode comparison: a dependent chain that is not slower is visible'
 
   assert.equal(comparison.dependentExceedsIndependent, false);
   assert.ok(comparison.ratio < 1);
+});
+
+function profileLedger({
+  lmUs = [2600, 2700, 3600],
+  featureInjected = true,
+  coverage = 0.5,
+} = {}) {
+  return {
+    results: [
+      {
+        model: 'base',
+        patchInfo: { featureInjected },
+        runs: lmUs.map((us, step) => ({
+          step,
+          coverage,
+          segments: [
+            { seq: step * 5, us: 40, dispatches: 1 },
+            { seq: step * 5 + 1, us: 30, dispatches: 3 },
+            // third from last: the single-dispatch LM head
+            { seq: step * 5 + 2, us, dispatches: 1 },
+            { seq: step * 5 + 3, us: 13, dispatches: 2 },
+            { seq: step * 5 + 4, us: 4, dispatches: 1 },
+          ],
+        })),
+      },
+    ],
+  };
+}
+
+test('timestamp gate: a profile without timestamp-query is refused', () => {
+  assert.throws(
+    () => requireTimestampQuery(profileLedger({ featureInjected: false })),
+    /timestamp-query/,
+  );
+  assert.throws(
+    () => requireTimestampQuery({ results: [] }),
+    /no results/i,
+  );
+});
+
+test('timestamp gate: a profile with zero coverage is refused', () => {
+  assert.throws(
+    () => requireTimestampQuery(profileLedger({ coverage: 0 })),
+    /coverage/,
+  );
+});
+
+test('lm head pass: the third-from-last single dispatch is selected per step', () => {
+  const passes = lmHeadPasses(profileLedger());
+
+  assert.equal(passes.length, 1);
+  assert.equal(passes[0].model, 'base');
+  assert.equal(passes[0].medianUs, 2700);
+  assert.deepEqual(
+    passes[0].steps.map((step) => step.us),
+    [2600, 2700, 3600],
+  );
+  assert.ok(passes[0].steps.every((step) => step.index === 2));
+});
+
+test('lm head pass: a third-from-last pass with two dispatches is refused', () => {
+  const ledger = profileLedger();
+  ledger.results[0].runs[0].segments[2].dispatches = 2;
+
+  assert.throws(() => lmHeadPasses(ledger), /one dispatch/);
+});
+
+test('lm head pass: a larger single-dispatch earlier in the step is refused', () => {
+  const ledger = profileLedger();
+  ledger.results[0].runs[0].segments[0].us = 9999;
+
+  assert.throws(() => lmHeadPasses(ledger), /largest single-dispatch/);
+});
+
+test('lm head utilization: bytes over measured GPU time, against the ceiling', () => {
+  // 232,783,872 bytes in 2.7 ms = 86.2 GB/s; against a 120 GB/s ceiling.
+  const [entry] = lmHeadUtilization(profileLedger(), {
+    bytesByModel: { base: 232783872 },
+    ceilingGbps: 120,
+  });
+
+  assert.equal(entry.model, 'base');
+  assert.equal(entry.medianUs, 2700);
+  assert.equal(entry.bytes, 232783872);
+  assert.deepEqual(
+    entry.steps.map((step) => step.us),
+    [2600, 2700, 3600],
+  );
+  assert.ok(Math.abs(entry.gbps - 86.216249) < 0.001);
+  assert.ok(Math.abs(entry.percent - 71.846874) < 0.001);
+});
+
+test('lm head utilization: refuses to estimate when timestamps are missing', () => {
+  assert.throws(
+    () =>
+      lmHeadUtilization(profileLedger({ featureInjected: false }), {
+        bytesByModel: { base: 232783872 },
+        ceilingGbps: 120,
+      }),
+    /timestamp-query/,
+  );
+});
+
+test('lm head utilization: refuses a model with no recorded weight bytes', () => {
+  assert.throws(
+    () =>
+      lmHeadUtilization(profileLedger(), {
+        bytesByModel: { gate1: 1 },
+        ceilingGbps: 120,
+      }),
+    /no recorded weight bytes for model "base"/,
+  );
+});
+
+test('combine plateaus: the mean ceiling and the later start', () => {
+  const combined = combinePlateaus([
+    { gbps: 109.01, fromBytes: 8 * 1024 * 1024 },
+    { gbps: 109.44, fromBytes: 16 * 1024 * 1024 },
+  ]);
+
+  assert.ok(Math.abs(combined.gbps - 109.225) < 0.001);
+  assert.equal(combined.fromBytes, 16 * 1024 * 1024);
+  assert.equal(combined.agreement.within, true);
+  assert.equal(combined.perSweep.length, 2);
+});
+
+test('combine plateaus: exactly two sweeps, both positive', () => {
+  assert.throws(() => combinePlateaus([]), /two/i);
+  assert.throws(
+    () => combinePlateaus([{ gbps: 1, fromBytes: 1 }]),
+    /two/i,
+  );
+  assert.throws(
+    () =>
+      combinePlateaus([
+        { gbps: 0, fromBytes: 1 },
+        { gbps: 1, fromBytes: 1 },
+      ]),
+    /positive/i,
+  );
 });
 
 test('the existing experiment ledgers still fit the seam unchanged', async () => {

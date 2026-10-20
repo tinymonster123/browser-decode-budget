@@ -7,7 +7,8 @@ ARTIFACT ?= models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f1
 GATE1 ?= models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f16.onnx
 GATE2 ?= models/derived/gemma4-e2b-q4f16-gate2/onnx/decoder_model_merged_q4f16.onnx
 
-.PHONY: test test-js census cost gate0 gate1 gate1-check gate2 gate2-check bench-prepare bench
+.PHONY: test test-js census cost gate0 gate1 gate1-check gate2 gate2-check bench-prepare bench \
+	bench-bandwidth lm-head-weights lm-head-utilization
 
 test:
 	$(PY) -m unittest discover -s tools/tests -v
@@ -76,6 +77,22 @@ bench-microbench: bench-prepare
 # Gate 5: per-compute-pass GPU timestamps.
 bench-profile: bench-prepare
 	node bench/browser/gpu-profile.mjs
+
+# Gate 6: achievable read bandwidth of this GPU, timed with timestamp-query.
+bench-bandwidth: bench-prepare
+	node bench/browser/bandwidth.mjs
+
+# Gate 6: LM head weight bytes (recorded once), then utilization from ledgers.
+lm-head-weights:
+	$(PY) tools/lm_head_weights.py --name base --model "$(DECODER)" \
+		--json runs/2026-10-20-lm-head-weights.json
+	$(PY) tools/lm_head_weights.py --name gate1 --model "$(GATE1)" \
+		--json runs/2026-10-20-lm-head-weights-gate1.json
+	$(PY) tools/lm_head_weights.py --name gate2 --model "$(GATE2)" \
+		--json runs/2026-10-20-lm-head-weights-gate2.json
+
+lm-head-utilization:
+	node bench/browser/lm-head-utilization.mjs
 
 # Gate 4 follow-up: what the cpu-timed pass costs, reconciled against exp 2.
 bench-perf-now:
