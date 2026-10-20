@@ -129,6 +129,7 @@ const ledger = stampLedger({
     weights: weightRecords.map((record) => ({
       model: record.name,
       bytes: record.totalBytes,
+      graphInitializerBytes: record.graphInitializerBytes,
       node: record.node,
       selection: record.selection,
       tensors: record.tensors,

@@ -1,6 +1,7 @@
 {
   "name": "gate2",
   "model": "models/derived/gemma4-e2b-q4f16-gate2/onnx/decoder_model_merged_q4f16.onnx",
+  "graphInitializerBytes": 1519728944,
   "node": "/lm_head/MatMul_Quant",
   "inputs": [
     "/lm_head/num_logits_to_keep/Slice/output_0",

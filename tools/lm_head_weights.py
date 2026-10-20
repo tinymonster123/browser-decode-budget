@@ -60,6 +60,11 @@ def tensor_bytes(tensor: onnx.TensorProto) -> int:
     return int(math.ceil(count * width))
 
 
+def total_initializer_bytes(model: onnx.ModelProto) -> int:
+    """All weight bytes in the graph, for the whole-model roofline."""
+    return sum(tensor_bytes(tensor) for tensor in model.graph.initializer)
+
+
 def find_lm_head(model: onnx.ModelProto) -> dict:
     """Return the MatMulNBits node under /lm_head/ and its initializer bytes."""
     initializers = {tensor.name: tensor for tensor in model.graph.initializer}
@@ -128,6 +133,7 @@ def main() -> int:
     record = {
         "name": args.name or model_path.stem,
         "model": str(model_path),
+        "graphInitializerBytes": total_initializer_bytes(model),
         **lm_head,
     }
 

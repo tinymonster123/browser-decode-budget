@@ -1,6 +1,7 @@
 {
   "name": "base",
   "model": "/Users/fenghanli/Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX/onnx/decoder_model_merged_q4f16.onnx",
+  "graphInitializerBytes": 1519728816,
   "node": "/lm_head/MatMul_Quant",
   "inputs": [
     "/lm_head/num_logits_to_keep/Slice/output_0",

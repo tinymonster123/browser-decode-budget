@@ -1,10 +1,10 @@
 {
-  "timestamp": "2026-10-20T05:08:10.028Z",
-  "commit": "2c82190",
+  "timestamp": "2026-10-20T05:21:02.985Z",
+  "commit": "4987fdc",
   "loadavg": [
-    2.36,
-    2.22,
-    2.73
+    2.24,
+    2.29,
+    2.47
   ],
   "config": {
     "profile": "/Users/fenghanli/Projects/fused-onnx/runs/2026-10-19-exp4-pass-profile.json",
@@ -22,6 +22,7 @@
       {
         "model": "base",
         "bytes": 232783872,
+        "graphInitializerBytes": 1519728816,
         "node": "/lm_head/MatMul_Quant",
         "selection": "named",
         "tensors": [
@@ -61,6 +62,7 @@
       {
         "model": "gate1",
         "bytes": 232783872,
+        "graphInitializerBytes": 1519728816,
         "node": "/lm_head/MatMul_Quant",
         "selection": "named",
         "tensors": [
@@ -100,6 +102,7 @@
       {
         "model": "gate2",
         "bytes": 232783872,
+        "graphInitializerBytes": 1519728944,
         "node": "/lm_head/MatMul_Quant",
         "selection": "named",
         "tensors": [

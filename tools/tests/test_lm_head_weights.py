@@ -15,7 +15,11 @@ from onnx import TensorProto, helper
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from lm_head_weights import find_lm_head, tensor_bytes  # noqa: E402
+from lm_head_weights import (  # noqa: E402
+    find_lm_head,
+    tensor_bytes,
+    total_initializer_bytes,
+)
 
 
 def _raw_initializer(name, dims, dtype, width):
@@ -76,6 +80,12 @@ class LmHeadWeightsTest(unittest.TestCase):
                 "lm_head_zp": 128,
             },
         )
+
+    def test_total_initializer_bytes_covers_the_whole_graph(self) -> None:
+        model = build_fixture()
+
+        # lm_head: 3072 + 384 + 128; decoy layer weight: 384.
+        self.assertEqual(total_initializer_bytes(model), 3968)
 
     def test_packed_uint8_counts_one_byte_per_element(self) -> None:
         tensor = _raw_initializer("w", [262144, 48, 16], TensorProto.UINT8, 1)
