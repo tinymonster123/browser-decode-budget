@@ -1,8 +1,9 @@
 # browser-decode-budget
 
 浏览器里 LLM decode 的时间账。项目从「减少 WebGPU dispatch 能不能把 decode 压下来」
-这个问题开始；Gate 6 用实测负结果关闭了这条路线（tag `gate6-closed`），
-现在的主线是**把这 27.2 ms 拆开**：哪些字节必须搬，哪些是调度和实现浪费。
+这个问题开始；Gate 6 用实测负结果关闭了这条路线（tag `gate6-closed`）。
+Gate 7 把 27.2 ms 按 op class 拆开：**71–75% 是 q4 矩阵乘，其余 kernel 25–29%**；
+下一个候选问题是 matmul 的带宽效率（推论，不是已选路线），而不是继续做图手术。
 
 从 `gemma-translate` 的 decode 实验中抽出。那边看到的是 29.9 ms/token；本项目
 先证伪了「瓶颈在每算子 dispatch」这个假设，再转向成本归因。
@@ -18,6 +19,7 @@
 | **4** | 删节点为什么没换成时间？ | ✅ 2026-10-19 | 一次 dispatch 1.32 µs；1112 次全删也只有 5.4% |
 | **5** | 27 ms 到底花在哪？ | ✅ 2026-10-19 | 最贵的 1 个 pass 占 13%；LM head 2.6 ms 只发 1 次 dispatch |
 | **6** | 还有没有 ≥10% 的路线？ | ❌ 2026-10-20 | **三条路线全关，无 frontier ticket**；见 `gate6-closed` |
+| **7** | 27 ms 按 op class 怎么分？ | ✅ 2026-10-20 | **MatMulNBits 71–75%**；其余所有 kernel 合计 25–29% |
 
 Gate 0 的完整报告见 [`docs/experiments/2026-10-19-gate0-census.md`](docs/experiments/2026-10-19-gate0-census.md)，
 Gate 1 见 [`docs/experiments/2026-10-19-gate1-manual-fusion.md`](docs/experiments/2026-10-19-gate1-manual-fusion.md)，
@@ -215,9 +217,38 @@ decode step 拆成 208–266 个 GPU 时间段。
 | GPU pass 时间之和 | 20.3–26.5 ms | 与 wall 同量级，GPU 全程在跑 |
 | CPU 调度管线 | 3.0–3.3 ms（12%） | 与 GPU 执行重叠 |
 
-地板上方还有约 13 ms 没有按 op class 归因（attention/KV、200+ 个小 pass、
-pass 间隙）。详见
+地板上方那部分当时没有归因；Gate 7 把它拆开了（见下一节），并把地板修正为
+12.08 ms（1.52 GB 里约 202 MB 是 rotary cache，不按 token 全读）。详见
 [`docs/experiments/2026-10-20-gate6-decision.md`](docs/experiments/2026-10-20-gate6-decision.md)。
+
+## Gate 7 结果：按 op class 拆开
+
+`GPUComputePassEncoder.writeTimestamp()` 在 pass 内仍然不可用（缺
+`chromium-experimental-timestamp-query-inside-passes`）。改用
+**一 dispatch 一 pass**：拦截 `beginComputePass`，每次 dispatch 后结束并重开
+pass，标准 `timestampWrites` 于是就是逐 dispatch 计时。op 名来自
+shader module 的描述符 `label`（pipeline label 为空）。
+
+base，4 个 decode step，每步 1112 个 dispatch，identity 覆盖率 100%：
+
+| op class | ms/step（run1） | share |
+|---|---:|---:|
+| **MatMulNBits**（q4 权重矩阵乘） | **18.10** | **71.3%** |
+| LayerNorm | 1.83 | 7.2% |
+| MatMul | 1.10 | 4.4% |
+| Mul | 0.66 | 2.6% |
+| Add | 0.65 | 2.6% |
+| 其余 20 类 | 3.04 | 12.0% |
+
+非 `MatMulNBits` 的全部 kernel 合计 **7.28 ms（28.7%）**。第二次运行
+（`...-run2.json`）给出 17.76 ms / 75.3%，matmul 时间差 1.9%，排序相同。
+MatMulNBits 的 726 个权重张量共 1.3178 GB，读取用了 18.10 / 17.76 ms，
+有效带宽 **72.8 / 74.2 GB/s = 109.06 GB/s 的 66.8% / 68.0%**；
+同一个模型里 LM head 单独测到 86.18 GB/s。
+
+所以 Gate 6 的「地板之上还有 13 ms」不是一块 13 ms 的别的计算：
+**是 matmul 自己没跑满带宽**。详见
+[`docs/experiments/2026-10-20-gate7-op-attribution.md`](docs/experiments/2026-10-20-gate7-op-attribution.md)。
 
 ## 目录
 
@@ -245,7 +276,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
 make test                  # Python 单测
-make test-js               # Gate 6 ledger 分析 seam 的单测（Node test runner）
+make test-js               # ledger 分析 seam + 驱动 seam 的单测（Node test runner）
 make census                # 生成 runs/2026-10-19-gate0-census.json
 make cost                  # 打印时间投影 + kill criterion
 make gate0                 # 以上三步
@@ -255,6 +286,7 @@ make gate2                 # 生成 Gate 2 artifact（全部 35 层 GQA）
 make gate2-check           # Gate1→Gate2 + 原始→Gate2 等价性检查
 make bench-prepare         # 准备浏览器 runtime 资产
 make bench                 # Chrome + WebGPU：默认 base vs gate2
+make bench-op-attribution  # Gate 7：一 dispatch 一 pass，按 op class 归因
 ```
 
 默认读取 `~/Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX`。
@@ -303,7 +335,10 @@ models/derived/<artifact-id>/
 - **Gate 5 — 逐 pass 归因（已完成）**：给每个 compute pass 加 timestamp，找到 LM head
   这个单 dispatch、2.6 ms 的下限。
 - **Gate 6 — 路线筛选（已完成，负结果）**：dispatch、LM head 带宽、dtype 三条全关。
-  本仓库在 `gate6-closed` 处冻结了这段历史；后续工作从「地板之上的 13 ms 归因」开始。
+  本仓库在 `gate6-closed` 处冻结了这段历史。
+- **Gate 7 — op 归因（已完成）**：一 dispatch 一 pass + shader module label，
+  得到 MatMulNBits 71–75%、其余 25–29% 的账。下一个问题变成「为什么 matmul
+  只跑到带宽上限的 67–68%」，而不是「另外 13 ms 花在哪」。
 
 ## 非目标
 

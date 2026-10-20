@@ -21,6 +21,7 @@ import {
   lmHeadPasses,
   lmHeadUtilization,
   combinePlateaus,
+  attributeOps,
 } from './ledger.mjs';
 
 function row(mode, count, wallMs, gpuMs = wallMs) {
@@ -526,4 +527,140 @@ test('the existing experiment ledgers still fit the seam unchanged', async () =>
 
   const slope = dispatchSlope(microbench, { mode: 'one-pass' });
   assert.ok(slope.usPerDispatch > 0);
+});
+
+// Gate 7: pass → identity attribution. The identity is whatever the page
+// observed; the analysis only groups and shares time.
+test('attributeOps: groups by identity and reports unlabeled coverage', () => {
+  const profile = {
+    runs: [
+      {
+        step: 0,
+        segments: [
+          { us: 1000, dispatches: 10, pipelines: ['label:MatMulNBits'] },
+          { us: 500, dispatches: 1, pipelines: [] },
+        ],
+      },
+    ],
+  };
+
+  const out = attributeOps(profile);
+
+  assert.equal(out.steps[0].totalUs, 1500);
+  assert.equal(out.steps[0].passes, 2);
+  assert.equal(out.totalUsPerStep, 1500);
+  assert.equal(out.classes[0].key, 'label:MatMulNBits');
+  assert.equal(out.classes[0].label, 'MatMulNBits');
+  assert.equal(out.classes[0].usPerStep, 1000);
+  assert.equal(out.classes[1].key, 'unlabeled');
+  assert.equal(out.identityCoverage, 1000 / 1500);
+  assert.equal(out.unlabeledShare, 500 / 1500);
+  assert.equal(out.mixedPasses, 0);
+});
+
+test('attributeOps: a pass binding several pipelines is split evenly', () => {
+  const profile = {
+    runs: [
+      {
+        step: 0,
+        segments: [
+          { us: 100, dispatches: 4, pipelines: ['label:A', 'label:B', 'label:A'] },
+        ],
+      },
+    ],
+  };
+
+  const out = attributeOps(profile);
+  const byKey = Object.fromEntries(out.classes.map((row) => [row.key, row]));
+
+  assert.equal(byKey['label:A'].usPerStep, 50);
+  assert.equal(byKey['label:B'].usPerStep, 50);
+  assert.equal(byKey['label:A'].dispatchesPerStep, 2);
+  assert.equal(byKey['label:B'].passesPerStep, 0.5);
+  assert.equal(out.mixedPasses, 1);
+  assert.equal(out.identityCoverage, 1);
+});
+
+test('attributeOps: per-step means and stability across steps', () => {
+  const profile = {
+    runs: [
+      {
+        step: 0,
+        segments: [
+          { us: 100, dispatches: 1, pipelines: ['label:A'] },
+          { us: 300, dispatches: 3, pipelines: ['label:B'] },
+        ],
+      },
+      {
+        step: 1,
+        segments: [
+          { us: 200, dispatches: 1, pipelines: ['label:A'] },
+          { us: 300, dispatches: 3, pipelines: ['label:B'] },
+        ],
+      },
+    ],
+  };
+
+  const out = attributeOps(profile);
+  const byKey = Object.fromEntries(out.classes.map((row) => [row.key, row]));
+
+  assert.equal(byKey['label:A'].usPerStep, 150);
+  assert.ok(Math.abs(byKey['label:A'].stability.deltaPercent - (100 / 150) * 100) < 1e-9);
+  assert.equal(byKey['label:B'].usPerStep, 300);
+  assert.equal(byKey['label:B'].stability.deltaPercent, 0);
+  assert.deepEqual(byKey['label:A'].perStep.map((row) => row.step), [0, 1]);
+  assert.deepEqual(
+    byKey['label:A'].perStep.map((row) => row.share),
+    [0.25, 0.4],
+  );
+  assert.equal(byKey['label:A'].shareStability.min, 0.25);
+  assert.equal(byKey['label:A'].shareStability.max, 0.4);
+});
+
+test('attributeOps: refuses an empty profile instead of returning zero rows', () => {
+  assert.throws(() => attributeOps({ runs: [] }), /no usable decode steps/);
+});
+
+test('attributeOps: subtracts the per-dispatch pass boundary, not below zero', () => {
+  const profile = {
+    runs: [
+      {
+        step: 0,
+        segments: [
+          { us: 10, dispatches: 1, pipelines: ['op:A'] },
+          { us: 1, dispatches: 1, pipelines: ['op:B'] },
+        ],
+      },
+    ],
+  };
+
+  const out = attributeOps(profile, { perDispatchOverheadUs: 2 });
+  const byKey = Object.fromEntries(out.classes.map((row) => [row.key, row]));
+
+  assert.equal(out.perDispatchOverheadUs, 2);
+  assert.equal(byKey['op:A'].correctedUsPerStep, 8);
+  assert.equal(byKey['op:B'].correctedUsPerStep, 0);
+  assert.equal(out.totalCorrectedUsPerStep, 8);
+  assert.ok(Math.abs(byKey['op:A'].share - 10 / 11) < 1e-9);
+  assert.equal(byKey['op:A'].correctedShare, 1);
+});
+
+test('attributeOps: a shader hash is an identity but not a named op', () => {
+  const profile = {
+    runs: [
+      {
+        step: 0,
+        segments: [
+          { us: 50, dispatches: 1, pipelines: ['op:MatMulNBits'] },
+          { us: 25, dispatches: 1, pipelines: ['shader:abcd1234:main'] },
+          { us: 25, dispatches: 1, pipelines: [] },
+        ],
+      },
+    ],
+  };
+
+  const out = attributeOps(profile);
+
+  assert.equal(out.identityCoverage, 0.5);
+  assert.equal(out.unlabeledShare, 0.25);
 });

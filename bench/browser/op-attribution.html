@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="data:," />
+    <title>browser-decode-budget op attribution</title>
+    <style>
+      body {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        margin: 2rem;
+        line-height: 1.5;
+      }
+      #status {
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>browser-decode-budget op attribution</h1>
+    <div id="status">booting…</div>
+    <script type="importmap">
+      {
+        "imports": {
+          "onnxruntime-web/webgpu": "/vendor/ort-web/ort.webgpu.bundle.min.mjs",
+          "onnxruntime-common": "/vendor/ort-web/onnxruntime-common/index.js"
+        }
+      }
+    </script>
+    <script type="module">
+      // Gate 7: attribute each compute pass to the kernel that issued it.
+      //
+      // ORT's WebGPU EP is compiled into wasm; the JS boundary still receives
+      // a descriptor for every shader module and pipeline. Those descriptors
+      // carry a label from the C++ side, so a pipeline created with
+      // label:"MatMulNBits" is identifiable without touching ORT internals.
+      // We record the label (and a shader-code hash as a fallback) at creation
+      // and attach it to each pass through setPipeline.
+      import { DEFAULT_TEXT, configureEnv, generate, loadModel, status } from './page-session.mjs';
+      import { MAX_QUERIES, collectSegments, newEncoderRecord } from './gpu-timeline.mjs';
+      import {
+        interceptDevice,
+        prototypesOf,
+        withThrowawayDevice,
+        wrapMethod,
+      } from './webgpu-patch.mjs';
+
+      configureEnv();
+
+      let ortDevice = null;
+      let profileEnabled = false;
+      let passSeq = 0;
+      let records = [];
+      let patchInfo = {
+        pass: false,
+        encoder: false,
+        device: false,
+        shader: false,
+        pipeline: false,
+        featureInjected: false,
+      };
+
+      // Creation-time metadata. Pipelines are reused across steps, so these
+      // maps must live for the whole session, not per profile step.
+      const modules = new WeakMap(); // GPUShaderModule -> { label, hash, codeLength }
+      const pipelines = new WeakMap(); // GPUComputePipeline -> { label, module, key }
+      const identityDetails = new Map(); // key -> what the descriptor revealed
+
+      let nextModuleId = 0;
+      let nextPipelineId = 0;
+
+      const encMeta = new WeakMap();
+
+      function fnv1a(text) {
+        let hash = 0x811c9dc5;
+        for (let i = 0; i < text.length; i++) {
+          hash ^= text.charCodeAt(i);
+          hash = Math.imul(hash, 0x01000193) >>> 0;
+        }
+        return hash.toString(16).padStart(8, '0');
+      }
+
+      function pipelineKey(meta) {
+        return meta?.key ?? 'unlabeled';
+      }
+
+      // writeTimestamp() inside a pass needs an experimental feature this
+      // Chrome does not expose. The exact alternative is one pass per
+      // dispatch: a pass boundary timestamp then IS the dispatch timestamp.
+      // ORT sees a normal encoder; the wrapper ends and reopens a pass after
+      // each dispatch and replays the pipeline and bind groups, which is all
+      // a pass boundary requires.
+      function splitPass(encoder, desc, rec, begin) {
+        const state = {
+          pipeline: null,
+          pipelineKey: 'unlabeled',
+          bindGroups: new Map(),
+          pipelines: [],
+          dispatches: 0,
+        };
+        let inner = null;
+        let slot = null;
+
+        const ensure = () => {
+          if (inner) return inner;
+          if (rec.n + 2 > MAX_QUERIES) {
+            rec.overflow = true;
+            slot = null;
+            inner = begin.call(encoder, { ...desc });
+            return inner;
+          }
+          slot = rec.n;
+          rec.n += 2;
+          inner = begin.call(encoder, {
+            ...desc,
+            timestampWrites: {
+              querySet: rec.qs,
+              beginningOfPassWriteIndex: slot,
+              endOfPassWriteIndex: slot + 1,
+            },
+          });
+          if (state.pipeline) inner.setPipeline(state.pipeline);
+          for (const [index, entry] of state.bindGroups) {
+            if (entry.offsets.length) {
+              inner.setBindGroup(index, entry.group, ...entry.offsets);
+            } else {
+              inner.setBindGroup(index, entry.group);
+            }
+          }
+          return inner;
+        };
+
+        const flush = () => {
+          if (!inner) return;
+          inner.end();
+          if (slot != null && state.dispatches > 0) {
+            rec.passes.push({
+              seq: passSeq++,
+              slot,
+              dispatches: state.dispatches,
+              pipelines: [...new Set(state.pipelines)],
+            });
+          }
+          inner = null;
+          slot = null;
+          state.dispatches = 0;
+          state.pipelines = [];
+        };
+
+        return {
+          setPipeline(pipeline) {
+            state.pipeline = pipeline;
+            state.pipelineKey = pipelineKey(pipelines.get(pipeline));
+            state.pipelines.push(state.pipelineKey);
+            ensure().setPipeline(pipeline);
+          },
+          setBindGroup(index, group, ...offsets) {
+            state.bindGroups.set(index, { group, offsets });
+            ensure().setBindGroup(index, group, ...offsets);
+          },
+          dispatchWorkgroups(...args) {
+            ensure().dispatchWorkgroups(...args);
+            state.dispatches += 1;
+            flush();
+          },
+          dispatchWorkgroupsIndirect(...args) {
+            ensure().dispatchWorkgroupsIndirect(...args);
+            state.dispatches += 1;
+            flush();
+          },
+          end() {
+            flush();
+          },
+          pushDebugGroup(label) {
+            ensure().pushDebugGroup(label);
+          },
+          popDebugGroup() {
+            ensure().popDebugGroup();
+          },
+          insertDebugMarker(label) {
+            ensure().insertDebugMarker?.(label);
+          },
+        };
+      }
+
+      function patchFrom(device) {
+        const protos = prototypesOf(device);
+
+        patchInfo.device =
+          wrapMethod(protos.device, 'createCommandEncoder', (orig) =>
+            function (...args) {
+              const enc = orig.apply(this, args);
+              if (profileEnabled && this === ortDevice) {
+                const rec = newEncoderRecord(this);
+                encMeta.set(enc, rec);
+                records.push(rec);
+              }
+              return enc;
+            },
+          ) || patchInfo.device;
+
+        // --- creation-time identity ------------------------------------
+        patchInfo.shader =
+          wrapMethod(protos.device, 'createShaderModule', (orig) =>
+            function (desc) {
+              const module = orig.call(this, desc);
+              const code = typeof desc?.code === 'string' ? desc.code : '';
+              modules.set(module, {
+                id: nextModuleId++,
+                label: desc?.label ?? '',
+                hash: code ? fnv1a(code) : '',
+                codeLength: code.length,
+                preview: code.slice(0, 240).replace(/\s+/g, ' '),
+              });
+              return module;
+            },
+          ) || patchInfo.shader;
+
+        const recordPipeline = (pipeline, desc) => {
+          const moduleMeta = desc?.compute?.module ? modules.get(desc.compute.module) : null;
+          const entryPoint = desc?.compute?.entryPoint ?? '';
+          const label = desc?.label ?? '';
+          // The pipeline label is usually empty; the shader module label is
+          // the op name ORT compiled ("MatMulNBits", "LayerNorm", ...). Prefer
+          // it, and fall back to the shader hash only when both are absent.
+          const key = label
+            ? `label:${label}`
+            : moduleMeta?.label
+              ? `op:${moduleMeta.label}`
+              : moduleMeta?.hash
+                ? `shader:${moduleMeta.hash}:${entryPoint}`
+                : `pipeline:${nextPipelineId}`;
+          pipelines.set(pipeline, {
+            id: nextPipelineId++,
+            label,
+            entryPoint,
+            module: moduleMeta ?? null,
+            key,
+          });
+          if (!identityDetails.has(key)) {
+            identityDetails.set(key, {
+              key,
+              label,
+              entryPoint,
+              moduleLabel: moduleMeta?.label ?? '',
+              codeLength: moduleMeta?.codeLength ?? 0,
+              preview: moduleMeta?.preview ?? '',
+              pipelines: 0,
+              hashes: [],
+            });
+          }
+          const detail = identityDetails.get(key);
+          detail.pipelines += 1;
+          if (moduleMeta?.hash && !detail.hashes.includes(moduleMeta.hash)) {
+            detail.hashes.push(moduleMeta.hash);
+          }
+          return pipeline;
+        };
+
+        patchInfo.pipeline =
+          wrapMethod(protos.device, 'createComputePipeline', (orig) =>
+            function (desc) {
+              return recordPipeline(orig.call(this, desc), desc);
+            },
+          ) || patchInfo.pipeline;
+
+        patchInfo.pipeline =
+          wrapMethod(protos.device, 'createComputePipelineAsync', (orig) =>
+            function (desc) {
+              return orig.call(this, desc).then((pipeline) => recordPipeline(pipeline, desc));
+            },
+          ) || patchInfo.pipeline;
+
+        // --- one pass per dispatch -------------------------------------
+        patchInfo.encoder =
+          wrapMethod(protos.encoder, 'beginComputePass', (orig) =>
+            function (desc = {}) {
+              const rec = encMeta.get(this);
+              if (!rec) return orig.apply(this, arguments);
+              return splitPass(this, desc, rec, orig);
+            },
+          ) || patchInfo.encoder;
+
+        patchInfo.encoder =
+          wrapMethod(protos.encoder, 'finish', (orig) =>
+            function (...args) {
+              const rec = encMeta.get(this);
+              if (rec && rec.n > 0) {
+                this.resolveQuerySet(rec.qs, 0, rec.n, rec.resolveBuf, 0);
+                this.copyBufferToBuffer(rec.resolveBuf, 0, rec.readBuf, 0, rec.n * 8);
+              }
+              return orig.apply(this, args);
+            },
+          ) || patchInfo.encoder;
+
+        // splitPass implements the pass surface ORT uses; these checks only
+        // prove the original methods exist to be mirrored.
+        patchInfo.pass = [
+          'setPipeline',
+          'setBindGroup',
+          'dispatchWorkgroups',
+          'dispatchWorkgroupsIndirect',
+        ].every((name) => typeof protos.pass?.[name] === 'function');
+      }
+
+      interceptDevice({
+        onDevice: (device) => {
+          ortDevice = device;
+          patchFrom(device);
+        },
+        extendDescriptor: (desc, adapter) => {
+          if (!adapter.features?.has?.('timestamp-query')) return desc;
+          const required = new Set(desc.requiredFeatures ?? []);
+          required.add('timestamp-query');
+          patchInfo.featureInjected = true;
+          return { ...desc, requiredFeatures: [...required] };
+        },
+      });
+
+      async function ensurePatched() {
+        if (ortDevice) return true;
+        return withThrowawayDevice(patchFrom);
+      }
+
+      function summarizeStep(segments, step) {
+        if (!segments.length) return null;
+        const sumUs = segments.reduce((sum, segment) => sum + segment.us, 0);
+        const start = Math.min(...segments.map((segment) => segment.startNs));
+        const end = Math.max(...segments.map((segment) => segment.endNs));
+        const spanUs = (end - start) / 1000;
+        return {
+          step,
+          passes: segments.length,
+          totalDispatches: segments.reduce((sum, segment) => sum + segment.dispatches, 0),
+          sumUs,
+          spanUs,
+          coverage: spanUs ? sumUs / spanUs : null,
+          overflowEncoders: segments.overflowEncoders ?? 0,
+          segments: segments.map((segment) => ({
+            seq: segment.seq,
+            us: Number(segment.us.toFixed(3)),
+            dispatches: segment.dispatches,
+            pipelines: segment.pipelines,
+          })),
+        };
+      }
+
+      async function attribute({
+        model = 'base',
+        text = DEFAULT_TEXT,
+        profileTokens = 4,
+      } = {}) {
+        const result = {
+          userAgent: navigator.userAgent,
+          hasWebGpu: 'gpu' in navigator,
+          model,
+          patchInfo: null,
+          loadMs: null,
+          runs: [],
+          pipelineCount: 0,
+          shaderCount: 0,
+          error: null,
+          stack: null,
+        };
+
+        try {
+          const ok = await ensurePatched();
+          if (!ok) throw new Error('WebGPU unavailable: no adapter');
+
+          const loaded = await loadModel(model);
+          result.loadMs = loaded.loadMs;
+
+          status(`warmup ${model}…`);
+          profileEnabled = false;
+          await generate(loaded.pipe, 2, text);
+
+          records = [];
+          passSeq = 0;
+          const stepMarks = [];
+          const tokenTimes = [];
+          status(`attributing ${model}: ${profileTokens} decode steps…`);
+          const run = await generate(loaded.pipe, profileTokens + 1, text, (tokenIndex) => {
+            if (tokenIndex >= 1) profileEnabled = true;
+            stepMarks.push(passSeq);
+            tokenTimes.push(performance.now());
+          });
+          profileEnabled = false;
+
+          const segments = await collectSegments(records, ortDevice);
+          result.wallMs = run.totalMs;
+          result.tokens = run.tokens;
+
+          const overflowEncoders = segments.overflowEncoders ?? 0;
+          for (let k = 0; k + 1 < stepMarks.length; k++) {
+            const from = stepMarks[k];
+            const to = stepMarks[k + 1];
+            const slice = segments.filter((segment) => segment.seq >= from && segment.seq < to);
+            const summary = summarizeStep(slice, k);
+            if (summary) {
+              if (tokenTimes[k] != null && tokenTimes[k + 1] != null) {
+                summary.stepWallMs = tokenTimes[k + 1] - tokenTimes[k];
+              }
+              // Attach it after filtering: a slice is a new array and would
+              // otherwise lose the property set on the full segment list.
+              summary.overflowEncoders = overflowEncoders;
+              result.runs.push(summary);
+            }
+          }
+
+          // Distinct identities seen, so an empty label space is visible.
+          const seenPipelines = new Set();
+          for (const segment of segments) {
+            for (const key of segment.pipelines) seenPipelines.add(key);
+          }
+          result.pipelineCount = seenPipelines.size;
+          result.patchInfo = { ...patchInfo };
+          result.identities = [...seenPipelines].sort();
+          result.identityDetails = Object.fromEntries(identityDetails);
+        } catch (error) {
+          result.error = String(error);
+          result.stack = error?.stack ?? null;
+        }
+
+        profileEnabled = false;
+        status(result.error ? `error: ${result.error}` : 'done');
+        return result;
+      }
+
+      window.__attribute = attribute;
+      window.__ready = true;
+      status('ready');
+    </script>
+  </body>
+</html>

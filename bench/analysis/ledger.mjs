@@ -1,7 +1,7 @@
-// The ledger seam for Gate 6.
+// The ledger seam.
 //
 // Plain JSON in, plain numbers out. Nothing here touches a browser, a GPU or
-// a model, so the numbers used for the decision can be re-derived from the
+// a model, so the numbers used for a decision can be re-derived from the
 // ledgers in `runs/` and checked with `node --test`.
 //
 // Ledger shapes this module reads:
@@ -9,6 +9,7 @@
 //   microbench  { result: { rows: [{ mode, sweep, count, wallMs, gpuMs, ... }] } }
 //   count       { nodeCounts: { model: n }, results: [{ model, variants: [{ runs }] }] }
 //   profile     { results: [{ model, patchInfo: { featureInjected }, runs: [{ coverage, segments }] }] }
+//   attribution { results: [{ model, runs: [{ step, segments: [{ us, dispatches, pipelines }] }] }] }
 //   bandwidth   [{ bytes, ms }]
 //
 // A microbench ledger may hold several `sweep`s of the same mode; callers
@@ -386,4 +387,167 @@ export function compareModels(ledger, { pairs = [] } = {}) {
         deltaDispatches !== 0 ? (deltaMsPerStep * 1000) / deltaDispatches : null,
     };
   });
+}
+
+// Gate 7: attribute each compute pass to the pipeline identity that issued it.
+//
+// A pass that binds several pipelines (a loop inside one encoder) is split
+// evenly, because the GPU timestamps bound the whole pass, not each dispatch.
+// Identity keys are opaque: "label:<ORT label>", "shader:<hash>:<entry>",
+// "pipeline:<n>" or "unlabeled". This function never guesses an op name; it
+// groups by whatever identity the page could observe.
+export function attributeOps(profile, { perDispatchOverheadUs = 0 } = {}) {
+  const runs = [...(profile?.runs ?? [])];
+  if (!runs.length) throw new Error('attributeOps: no usable decode steps');
+
+  const classes = new Map();
+  const stepsOut = [];
+  let mixedPasses = 0;
+
+  const add = (target, us, passes, dispatches) => {
+    target.us += us;
+    target.passes += passes;
+    target.dispatches += dispatches;
+  };
+
+  for (const run of runs) {
+    const step = run.step;
+    let totalUs = 0;
+    let passes = 0;
+
+    for (const segment of run.segments ?? []) {
+      const us = Number(segment.us);
+      if (!Number.isFinite(us) || us < 0) continue;
+      const keys = [...new Set((segment.pipelines ?? []).filter(Boolean))];
+      const divisor = keys.length || 1;
+      const share = us / divisor;
+      const dispatchShare = (segment.dispatches ?? 0) / divisor;
+
+      totalUs += us;
+      passes += 1;
+      if (keys.length > 1) mixedPasses += 1;
+
+      for (const key of keys.length ? keys : ['unlabeled']) {
+        let entry = classes.get(key);
+        if (!entry) {
+          entry = {
+            key,
+            label: labelOf(key),
+            us: 0,
+            passes: 0,
+            dispatches: 0,
+            perStep: new Map(),
+          };
+          classes.set(key, entry);
+        }
+        add(entry, share, 1 / divisor, dispatchShare);
+
+        const row = entry.perStep.get(step) ?? {
+          step,
+          us: 0,
+          passes: 0,
+          dispatches: 0,
+        };
+        add(row, share, 1 / divisor, dispatchShare);
+        entry.perStep.set(step, row);
+      }
+    }
+
+    stepsOut.push({ step, totalUs, passes });
+  }
+
+  const stepTotals = new Map(stepsOut.map((row) => [row.step, row.totalUs]));
+  const totalUs = stepsOut.reduce((sum, row) => sum + row.totalUs, 0);
+  const stepCount = runs.length;
+  const unlabeledUs = classes.get('unlabeled')?.us ?? 0;
+
+  // Only a label or op key names the kernel. A shader hash or a pipeline
+  // ordinal is an identity, not a name, so it does not count as coverage.
+  const namedUs = [...classes.values()]
+    .filter((entry) => entry.key.startsWith('label:') || entry.key.startsWith('op:'))
+    .reduce((sum, entry) => sum + entry.us, 0);
+
+  const rows = [...classes.values()]
+    .map((entry) => {
+      const perStep = [...entry.perStep.values()]
+        .map((row) => ({
+          ...row,
+          share: stepTotals.get(row.step) ? row.us / stepTotals.get(row.step) : null,
+        }))
+        .sort((a, b) => a.step - b.step);
+
+      const values = perStep.map((row) => row.us);
+      const shares = perStep.map((row) => row.share ?? 0);
+      const meanUs = entry.us / stepCount;
+      const dispatchesPerStep = entry.dispatches / stepCount;
+      // One pass now holds one dispatch, so every dispatch also pays a pass
+      // boundary. This is an estimate built on the Gate 4 wall-clock slope;
+      // the raw value stays the measured fact.
+      const correctedUsPerStep = Math.max(
+        0,
+        meanUs - perDispatchOverheadUs * dispatchesPerStep,
+      );
+      const minUs = values.length ? Math.min(...values) : 0;
+      const maxUs = values.length ? Math.max(...values) : 0;
+      const minShare = shares.length ? Math.min(...shares) : 0;
+      const maxShare = shares.length ? Math.max(...shares) : 0;
+      return {
+        key: entry.key,
+        label: entry.label,
+        usPerStep: meanUs,
+        correctedUsPerStep,
+        passesPerStep: entry.passes / stepCount,
+        dispatchesPerStep,
+        share: totalUs ? entry.us / totalUs : null,
+        stability:
+          values.length > 1
+            ? {
+                minUs,
+                maxUs,
+                deltaPercent: meanUs ? (100 * (maxUs - minUs)) / meanUs : null,
+              }
+            : null,
+        shareStability:
+          shares.length > 1
+            ? {
+                min: minShare,
+                max: maxShare,
+                deltaPoints: 100 * (maxShare - minShare),
+              }
+            : null,
+        perStep,
+      };
+    })
+    .sort((a, b) => b.usPerStep - a.usPerStep);
+
+  const totalCorrectedUs = rows.reduce((sum, row) => sum + row.correctedUsPerStep, 0);
+  for (const row of rows) {
+    row.correctedShare = totalCorrectedUs
+      ? row.correctedUsPerStep / totalCorrectedUs
+      : null;
+  }
+
+  return {
+    steps: stepsOut,
+    classes: rows,
+    perDispatchOverheadUs,
+    totalUsPerStep: totalUs / stepCount,
+    totalCorrectedUsPerStep: totalCorrectedUs,
+    identityCoverage: totalUs ? Math.min(1, namedUs / totalUs) : null,
+    unlabeledShare: totalUs ? unlabeledUs / totalUs : null,
+    mixedPasses,
+  };
+}
+
+// Identity grammar, produced by the browser pages and parsed here:
+//   label:<ORT pipeline label>      (empty in this ORT build)
+//   op:<shader module label>         the op name, e.g. "MatMulNBits"
+//   shader:<code hash>:<entryPoint>  unnamed fallback
+//   pipeline:<ordinal>               unnamed fallback
+//   unlabeled                        no identity at all
+function labelOf(key) {
+  if (key.startsWith('label:')) return key.slice('label:'.length);
+  if (key.startsWith('op:')) return key.slice('op:'.length);
+  if (key.startsWith('shader:')) return key.split(':')[1] ?? key;
+  return key;
 }

@@ -1,0 +1,94 @@
+{
+  "name": "decoder_model_merged_q4f16",
+  "model": "/Users/fenghanli/Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX/onnx/decoder_model_merged_q4f16.onnx",
+  "totalInitializerBytes": 1519728816,
+  "initializers": 1063,
+  "sharedInitializers": 20,
+  "sharedBytes": 201326876,
+  "rows": [
+    {
+      "opType": "MatMulNBits",
+      "initializers": 726,
+      "bytes": 1317820416,
+      "share": 0.8671418230185088
+    },
+    {
+      "opType": "RotaryEmbedding",
+      "initializers": 4,
+      "bytes": 201326592,
+      "share": 0.13247534025833724
+    },
+    {
+      "opType": "SimplifiedLayerNormalization",
+      "initializers": 242,
+      "bytes": 581120,
+      "share": 0.0003823840108063069
+    },
+    {
+      "opType": "Gather",
+      "initializers": 35,
+      "bytes": 280,
+      "share": 1.8424339727726793e-07
+    },
+    {
+      "opType": "Reshape",
+      "initializers": 10,
+      "bytes": 272,
+      "share": 1.7897930021220312e-07
+    },
+    {
+      "opType": "Mul",
+      "initializers": 39,
+      "bytes": 78,
+      "share": 5.132494638438178e-08
+    },
+    {
+      "opType": "Unsqueeze",
+      "initializers": 4,
+      "bytes": 40,
+      "share": 2.632048532532399e-08
+    },
+    {
+      "opType": "Range",
+      "initializers": 2,
+      "bytes": 16,
+      "share": 1.0528194130129596e-08
+    },
+    {
+      "opType": "Slice",
+      "initializers": 2,
+      "bytes": 16,
+      "share": 1.0528194130129596e-08
+    },
+    {
+      "opType": "Sub",
+      "initializers": 2,
+      "bytes": 10,
+      "share": 6.5801213313309975e-09
+    },
+    {
+      "opType": "Concat",
+      "initializers": 1,
+      "bytes": 8,
+      "share": 5.264097065064798e-09
+    },
+    {
+      "opType": "Less",
+      "initializers": 1,
+      "bytes": 8,
+      "share": 5.264097065064798e-09
+    },
+    {
+      "opType": "Where",
+      "initializers": 1,
+      "bytes": 2,
+      "share": 1.3160242662661995e-09
+    },
+    {
+      "opType": "Div",
+      "initializers": 1,
+      "bytes": 2,
+      "share": 1.3160242662661995e-09
+    }
+  ]
+}

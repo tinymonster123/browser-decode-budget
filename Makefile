@@ -8,7 +8,7 @@ GATE1 ?= models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f16.o
 GATE2 ?= models/derived/gemma4-e2b-q4f16-gate2/onnx/decoder_model_merged_q4f16.onnx
 
 .PHONY: test test-js census cost gate0 gate1 gate1-check gate2 gate2-check bench-prepare bench \
-	bench-bandwidth lm-head-weights lm-head-utilization
+	bench-op-attribution bench-bandwidth lm-head-weights lm-head-utilization weight-bytes
 
 test:
 	$(PY) -m unittest discover -s tools/tests -v
@@ -82,6 +82,10 @@ bench-profile: bench-prepare
 bench-bandwidth: bench-prepare
 	node bench/browser/bandwidth.mjs
 
+# Gate 7: one pass per dispatch, attributed by the shader module label.
+bench-op-attribution: bench-prepare
+	node bench/browser/op-attribution.mjs
+
 # Gate 6: LM head weight bytes (recorded once), then utilization from ledgers.
 lm-head-weights:
 	$(PY) tools/lm_head_weights.py --name base --model "$(DECODER)" \
@@ -93,6 +97,11 @@ lm-head-weights:
 
 lm-head-utilization:
 	node bench/browser/lm-head-utilization.mjs
+
+# Gate 7: initializer bytes grouped by the op that consumes them.
+weight-bytes:
+	$(PY) tools/weight_bytes_by_op.py --model "$(DECODER)" \
+		--json runs/2026-10-20-exp7-weight-bytes-by-op.json
 
 # Gate 4 follow-up: what the cpu-timed pass costs, reconciled against exp 2.
 bench-perf-now:
