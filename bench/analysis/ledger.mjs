@@ -6,9 +6,12 @@
 //
 // Ledger shapes this module reads:
 //
-//   microbench  { result: { rows: [{ mode, count, wallMs, ... }] } }
+//   microbench  { result: { rows: [{ mode, sweep, count, wallMs, gpuMs, ... }] } }
 //   count       { nodeCounts: { model: n }, results: [{ model, variants: [{ runs }] }] }
 //   bandwidth   [{ bytes, ms }]   (the probe in ticket #4 will report this array)
+//
+// A microbench ledger may hold several `sweep`s of the same mode; callers
+// select one sweep explicitly so two repetitions never mix in one fit.
 //
 // `makeLedger` is the one constructor for the envelope every driver writes;
 // its timestamp is injectable so tests stay deterministic.
@@ -32,18 +35,27 @@ function assertPositive(value, name) {
 
 // Slope between the two largest dispatch counts, in microseconds per
 // dispatch. Rows with count 0 carry the fixed pass setup and are excluded.
-export function dispatchSlope(ledger, { mode } = {}) {
+//
+// `sweep` selects one repetition of the whole sweep when a ledger contains
+// several; without it two repetitions would contribute rows with the same
+// count and the fit would either be ambiguous or fail.
+// `field` selects the timing channel: wall (encode + submit + GPU) or gpu
+// (submit-to-completion only).
+export function dispatchSlope(ledger, { mode, sweep, field = 'wallMs' } = {}) {
   const rows = (ledger?.result?.rows ?? ledger?.rows ?? []).filter(
     (row) =>
       row.mode === mode &&
+      (sweep == null || row.sweep === sweep) &&
       Number.isFinite(row.count) &&
       row.count > 0 &&
-      Number.isFinite(row.wallMs),
+      Number.isFinite(row[field]),
   );
 
   if (rows.length < 2) {
     throw new Error(
-      `dispatch slope needs at least two usable points for mode "${mode}", got ${rows.length}`,
+      `dispatch slope needs at least two usable points for mode "${mode}"` +
+        `${sweep == null ? '' : ` sweep ${sweep}`} in field "${field}", ` +
+        `got ${rows.length}`,
     );
   }
 
@@ -57,12 +69,62 @@ export function dispatchSlope(ledger, { mode } = {}) {
 
   return {
     mode,
+    sweep: sweep ?? null,
+    field,
     usPerDispatch:
-      ((second.wallMs - first.wallMs) * 1000) / (second.count - first.count),
+      ((second[field] - first[field]) * 1000) / (second.count - first.count),
     points: [
-      { count: first.count, wallMs: first.wallMs },
-      { count: second.count, wallMs: second.wallMs },
+      { count: first.count, [field]: first[field] },
+      { count: second.count, [field]: second[field] },
     ],
+  };
+}
+
+// Two repetitions of the same measurement. A number that moves more than
+// `tolerance` (a fraction) between them cannot be used for a decision.
+export function agreement(a, b, { tolerance = 0.1 } = {}) {
+  assertPositive(a, 'first measurement');
+  assertPositive(b, 'second measurement');
+
+  const mean = (a + b) / 2;
+  const deltaPercent = (Math.abs(a - b) / mean) * 100;
+
+  return {
+    a,
+    b,
+    mean,
+    deltaPercent,
+    tolerance,
+    within: deltaPercent / 100 <= tolerance,
+  };
+}
+
+// What removing N dispatches would save at a measured per-dispatch cost.
+// The result is in milliseconds because the decode budget is in milliseconds.
+export function fusionCeiling({ usPerDispatch, dispatchCounts }) {
+  assertPositive(usPerDispatch, 'usPerDispatch');
+  if (!Array.isArray(dispatchCounts) || dispatchCounts.length === 0) {
+    throw new Error('fusion ceiling needs at least one dispatch count');
+  }
+
+  return dispatchCounts.map((dispatches) => {
+    assertPositive(dispatches, 'dispatch count');
+    return { dispatches, ms: (usPerDispatch * dispatches) / 1000 };
+  });
+}
+
+// The serialized and independent slopes from the same harness. `ratio` is how
+// many times more expensive a dispatch is when the next one waits for it.
+export function dispatchModeComparison({ dependentUs, independentUs }) {
+  assertPositive(dependentUs, 'dependent dispatch cost');
+  assertPositive(independentUs, 'independent dispatch cost');
+
+  return {
+    dependentUs,
+    independentUs,
+    ratio: dependentUs / independentUs,
+    extraUs: dependentUs - independentUs,
+    dependentExceedsIndependent: dependentUs > independentUs,
   };
 }
 

@@ -14,6 +14,9 @@ import {
   countsRun,
   timingRun,
   makeLedger,
+  agreement,
+  fusionCeiling,
+  dispatchModeComparison,
 } from './ledger.mjs';
 
 function row(mode, count, wallMs, gpuMs = wallMs) {
@@ -247,6 +250,112 @@ test('compareModels: a model missing from the ledger is reported, not guessed', 
   const [comparison] = compareModels(ledger, { pairs: [['base', 'gate2']] });
 
   assert.equal(comparison.error, 'gate2 not found in ledger');
+});
+
+test('dispatch slope: a sweep filter keeps two runs of the same sweep apart', () => {
+  // Two sweeps of an identical dependent chain. If the filter were ignored,
+  // the last two rows would share count 2000 and the slope would refuse.
+  const ledger = {
+    result: {
+      rows: [
+        { ...row('dependent', 1000, 3), sweep: 0 },
+        { ...row('dependent', 2000, 5.5), sweep: 0 },
+        { ...row('dependent', 1000, 3.5), sweep: 1 },
+        { ...row('dependent', 2000, 6.5), sweep: 1 },
+      ],
+    },
+  };
+
+  assert.equal(
+    dispatchSlope(ledger, { mode: 'dependent', sweep: 0 }).usPerDispatch,
+    2.5,
+  );
+  assert.equal(
+    dispatchSlope(ledger, { mode: 'dependent', sweep: 1 }).usPerDispatch,
+    3,
+  );
+});
+
+test('dispatch slope: the timing field is selectable', () => {
+  const ledger = {
+    result: {
+      rows: [
+        { ...row('dependent', 1000, 3), gpuMs: 2.5, sweep: 0 },
+        { ...row('dependent', 2000, 5.5), gpuMs: 4.5, sweep: 0 },
+      ],
+    },
+  };
+
+  assert.equal(
+    dispatchSlope(ledger, { mode: 'dependent', field: 'gpuMs' }).usPerDispatch,
+    2,
+  );
+  assert.equal(
+    dispatchSlope(ledger, { mode: 'dependent' }).usPerDispatch,
+    2.5,
+  );
+});
+
+test('agreement: 2.0 vs 2.2 µs is within 10%, 2.0 vs 2.4 is not', () => {
+  const close = agreement(2.0, 2.2);
+  assert.equal(close.within, true);
+  assert.ok(Math.abs(close.deltaPercent - 9.5238) < 0.001);
+  assert.ok(Math.abs(close.mean - 2.1) < 1e-12);
+
+  const far = agreement(2.0, 2.4);
+  assert.equal(far.within, false);
+  assert.ok(Math.abs(far.deltaPercent - 18.1818) < 0.001);
+});
+
+test('agreement: refuses a zero measurement instead of reporting it', () => {
+  assert.throws(() => agreement(0, 2), /positive/i);
+  assert.throws(() => agreement(2, Number.NaN), /positive/i);
+});
+
+test('fusion ceiling: a known serialized slope multiplied by the dispatch counts', () => {
+  // 2.5 µs per dispatch: 211 dispatches = 0.5275 ms, 1112 = 2.78 ms.
+  const ceilings = fusionCeiling({
+    usPerDispatch: 2.5,
+    dispatchCounts: [211, 1112],
+  });
+
+  assert.deepEqual(ceilings, [
+    { dispatches: 211, ms: 0.5275 },
+    { dispatches: 1112, ms: 2.78 },
+  ]);
+});
+
+test('fusion ceiling: refuses a non-positive slope or an empty count list', () => {
+  assert.throws(
+    () => fusionCeiling({ usPerDispatch: 0, dispatchCounts: [211] }),
+    /positive/i,
+  );
+  assert.throws(
+    () => fusionCeiling({ usPerDispatch: 2, dispatchCounts: [] }),
+    /count/i,
+  );
+});
+
+test('dispatch mode comparison: dependent over independent ratio', () => {
+  // The machine's measured shape: 1.31 µs independent, 2.50 µs serialized.
+  const comparison = dispatchModeComparison({
+    dependentUs: 2.5,
+    independentUs: 1.31,
+  });
+
+  assert.equal(comparison.ratio, 2.5 / 1.31);
+  assert.equal(comparison.extraUs, 1.19);
+  assert.equal(comparison.dependentExceedsIndependent, true);
+});
+
+test('dispatch mode comparison: a dependent chain that is not slower is visible', () => {
+  const comparison = dispatchModeComparison({
+    dependentUs: 1.2,
+    independentUs: 1.31,
+  });
+
+  assert.equal(comparison.dependentExceedsIndependent, false);
+  assert.ok(comparison.ratio < 1);
 });
 
 test('the existing experiment ledgers still fit the seam unchanged', async () => {

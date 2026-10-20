@@ -25,14 +25,33 @@
         window.__reportProgress?.(text);
       };
 
+      // One recurrence for every mode, so the only difference between the
+      // independent and dependent measurements is how the dispatches are
+      // encoded. The recurrence is order-sensitive: a serialized chain of N
+      // dispatches always lands on lcg(0, N), while lost or reordered updates
+      // do not. One integer multiply-add per dispatch is negligible next to a
+      // pass boundary, and it turns the dependent run into a verifiable chain.
+      // One definition of the recurrence, used by both the shader and the
+      // expected-value check below. They must not drift apart.
+      const LCG_A = 1664525;
+      const LCG_C = 1013904223;
+
       const SHADER = /* wgsl */ `
         @group(0) @binding(0) var<storage, read_write> out: array<u32>;
 
         @compute @workgroup_size(1)
         fn main() {
-          out[0] = out[0] + 1u;
+          out[0] = out[0] * ${LCG_A}u + ${LCG_C}u;
         }
       `;
+
+      function lcg(value, steps) {
+        let current = value >>> 0;
+        for (let i = 0; i < steps; i++) {
+          current = (Math.imul(current, LCG_A) + LCG_C) >>> 0;
+        }
+        return current;
+      }
 
       function median(values) {
         const clean = values.filter((v) => Number.isFinite(v));
@@ -40,6 +59,24 @@
         const sorted = [...clean].sort((a, b) => a - b);
         const mid = Math.floor(sorted.length / 2);
         return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+      }
+
+      // External GPU work only ever adds time, never removes it, so the fast
+      // tail is the least contaminated estimate of the real cost. The strict
+      // minimum is still vulnerable to a rare anomalously fast sample (a clock
+      // boost, or a run the driver overlapped), so the decision channel is the
+      // 5th percentile: clean samples, with the extreme few rejected at both
+      // ends. The median and the minimum stay in the ledger next to it so the
+      // interference can be seen.
+      function percentile(values, p) {
+        const clean = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+        if (!clean.length) return null;
+        return clean[Math.min(clean.length - 1, Math.floor(p * (clean.length - 1)))];
+      }
+
+      function minimum(values) {
+        const clean = values.filter((v) => Number.isFinite(v));
+        return clean.length ? Math.min(...clean) : null;
       }
 
       async function setup() {
@@ -66,10 +103,28 @@
         return { device, pipeline, bindGroup, bindGroupLayout, buffer, info };
       }
 
+      // One dispatch per pass, each pass reading and writing the same element.
+      // WebGPU makes an earlier pass's write visible to the next pass, so the
+      // GPU cannot overlap these dispatches. `n-pass` keeps the historical
+      // encoding unchanged; `dependent` adds the value verification below.
+      function encodePassPerDispatch({ count, device, pipeline, bindGroup }) {
+        const enc = device.createCommandEncoder();
+        for (let i = 0; i < count; i++) {
+          const pass = enc.beginComputePass();
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, bindGroup);
+          pass.dispatchWorkgroups(1);
+          pass.end();
+        }
+        device.queue.submit([enc.finish()]);
+        return 1;
+      }
+
       // mode:
-      //   one-pass  -> N dispatches inside a single compute pass, one submit
-      //   n-pass    -> N compute passes in one encoder, one submit
-      //   n-submit  -> N encoders, N submits
+      //   one-pass   -> N dispatches inside a single compute pass, one submit
+      //   n-pass     -> N compute passes in one encoder, one submit
+      //   dependent  -> same encoding as n-pass, verified as a serial chain
+      //   n-submit   -> N encoders, N submits
       function encode({ mode, count, device, pipeline, bindGroup, buffer }) {
         const t0 = performance.now();
         let submits = 0;
@@ -83,17 +138,8 @@
           pass.end();
           device.queue.submit([enc.finish()]);
           submits = 1;
-        } else if (mode === 'n-pass') {
-          const enc = device.createCommandEncoder();
-          for (let i = 0; i < count; i++) {
-            const pass = enc.beginComputePass();
-            pass.setPipeline(pipeline);
-            pass.setBindGroup(0, bindGroup);
-            pass.dispatchWorkgroups(1);
-            pass.end();
-          }
-          device.queue.submit([enc.finish()]);
-          submits = 1;
+        } else if (mode === 'n-pass' || mode === 'dependent') {
+          submits = encodePassPerDispatch({ count, device, pipeline, bindGroup });
         } else if (mode === 'n-submit') {
           for (let i = 0; i < count; i++) {
             const enc = device.createCommandEncoder();
@@ -131,6 +177,21 @@
         return { cpuMs, submits };
       }
 
+      function summarize({ mode, count, samples }) {
+        return {
+          mode,
+          count,
+          samples,
+          wallMs: median(samples.map((s) => s.wallMs)),
+          cpuMs: median(samples.map((s) => s.cpuMs)),
+          gpuMs: median(samples.map((s) => s.gpuMs)),
+          minWallMs: minimum(samples.map((s) => s.wallMs)),
+          minGpuMs: minimum(samples.map((s) => s.gpuMs)),
+          p05WallMs: percentile(samples.map((s) => s.wallMs), 0.05),
+          p05GpuMs: percentile(samples.map((s) => s.gpuMs), 0.05),
+        };
+      }
+
       async function measure({ device, pipeline, bindGroup, buffer, mode, count, repeats }) {
         const samples = [];
         for (let i = 0; i < repeats; i++) {
@@ -154,10 +215,27 @@
             submits,
           });
         }
-        const wall = median(samples.map((s) => s.wallMs));
-        const cpu = median(samples.map((s) => s.cpuMs));
-        const gpu = median(samples.map((s) => s.gpuMs));
-        return { mode, count, samples, wallMs: wall, cpuMs: cpu, gpuMs: gpu };
+        return summarize({ mode, count, samples });
+      }
+
+      async function readU32(device, buffer) {
+        const staging = device.createBuffer({
+          size: 4,
+          usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+        const enc = device.createCommandEncoder();
+        enc.copyBufferToBuffer(buffer, 0, staging, 0, 4);
+        device.queue.submit([enc.finish()]);
+        await staging.mapAsync(GPUMapMode.READ);
+        const value = new Uint32Array(staging.getMappedRange())[0];
+        staging.unmap();
+        staging.destroy();
+        return value;
+      }
+
+      async function resetU32(device, buffer) {
+        device.queue.writeBuffer(buffer, 0, new Uint32Array([0]));
+        await device.queue.onSubmittedWorkDone();
       }
 
       async function createBindGroupCost({ device, pipeline, bindGroupLayout, buffer, repeats }) {
@@ -178,11 +256,19 @@
       }
 
       window.__microbench = async ({
-        counts = [0, 100, 500, 1000, 2000],
-        modes = ['one-pass', 'n-pass', 'n-submit', 'ort-like'],
-        repeats = 5,
+        counts = [0, 1000, 2000, 4000, 8000],
+        modes = ['one-pass', 'n-pass', 'dependent'],
+        repeats = 60,
+        sweeps = 2,
       } = {}) => {
-        const result = { info: null, rows: [], bindGroup: null, error: null, stack: null };
+        const result = {
+          info: null,
+          rows: [],
+          chain: [],
+          bindGroup: null,
+          error: null,
+          stack: null,
+        };
         try {
           const { device, pipeline, bindGroup, bindGroupLayout, buffer, info } = await setup();
           result.info = info
@@ -194,23 +280,83 @@
               }
             : null;
 
-          // Warm up compile + upload paths.
-          await measure({
-            device,
-            pipeline,
-            bindGroup,
-            buffer,
-            mode: 'one-pass',
-            count: 10,
-            repeats: 2,
-          });
+          // Bring the GPU to a steady clock before any sample is recorded.
+          // A short warm-up leaves the clock ramping during the first counts,
+          // which makes a small count look more expensive per dispatch than a
+          // large one. One second of continuous work is discarded; it exists
+          // to move the power state, not to contribute numbers.
+          const warmUntil = performance.now() + 1000;
+          let warmFlip = 0;
+          while (performance.now() < warmUntil) {
+            await measure({
+              device,
+              pipeline,
+              bindGroup,
+              buffer,
+              mode: warmFlip++ % 2 === 0 ? 'one-pass' : 'dependent',
+              count: 20000,
+              repeats: 1,
+            });
+          }
+          await device.queue.onSubmittedWorkDone();
 
+          // Repeat-major, then sweep, then count. Each repeat is one complete
+          // sweep, so the two slope points at 4000 and 8000 are sampled
+          // seconds apart rather than tens of seconds apart, and a quiet
+          // window of GPU time contributes to both. The sweep order flips
+          // every repeat so neither sweep systematically inherits the state
+          // left by the other.
           for (const mode of modes) {
-            for (const count of counts) {
-              status(`measuring ${mode} count=${count}…`);
-              result.rows.push(
-                await measure({ device, pipeline, bindGroup, buffer, mode, count, repeats }),
-              );
+            const samples = new Map();
+            for (let repeat = 0; repeat < repeats; repeat++) {
+              const order = repeat % 2 === 1
+                ? Array.from({ length: sweeps }, (_, i) => sweeps - 1 - i)
+                : Array.from({ length: sweeps }, (_, i) => i);
+              for (const sweep of order) {
+                for (const count of counts) {
+                  status(
+                    `repeat ${repeat}/${repeats - 1} sweep ${sweep}/${sweeps - 1} ` +
+                      `${mode} count=${count}…`,
+                  );
+                  if (mode === 'dependent') await resetU32(device, buffer);
+                  const sample = await measure({
+                    device,
+                    pipeline,
+                    bindGroup,
+                    buffer,
+                    mode,
+                    count,
+                    repeats: 1,
+                  });
+                  const key = `${sweep}:${count}`;
+                  if (!samples.has(key)) samples.set(key, []);
+                  samples.get(key).push(sample.samples[0]);
+                  if (mode === 'dependent') {
+                    const actual = await readU32(device, buffer);
+                    const expected = lcg(0, count);
+                    result.chain.push({
+                      sweep,
+                      count,
+                      repeat,
+                      expected,
+                      actual,
+                      ok: actual === expected,
+                    });
+                  }
+                }
+              }
+            }
+            for (let sweep = 0; sweep < sweeps; sweep++) {
+              for (const count of counts) {
+                result.rows.push({
+                  ...summarize({
+                    mode,
+                    count,
+                    samples: samples.get(`${sweep}:${count}`) ?? [],
+                  }),
+                  sweep,
+                });
+              }
             }
           }
 

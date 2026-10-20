@@ -69,7 +69,7 @@ bench: bench-prepare
 bench-count: bench-prepare
 	node bench/browser/count.mjs
 
-# Gate 4: measure what one dispatch / pass / submit costs on this machine.
+# Gate 6: measure the serialized dispatch cost (and the independent baseline).
 bench-microbench: bench-prepare
 	node bench/browser/gpu-microbench.mjs
 
