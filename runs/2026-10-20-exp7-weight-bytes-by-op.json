@@ -90,5 +90,145 @@
       "bytes": 2,
       "share": 1.3160242662661995e-09
     }
-  ]
+  ],
+  "fingerprints": {
+    "opType": "MatMulNBits",
+    "entries": [
+      {
+        "sizes": [
+          6291456,
+          25165824,
+          201326592
+        ],
+        "bytes": 232783872,
+        "nodes": 1,
+        "sample": "/lm_head/MatMul_Quant",
+        "dims": [
+          262144,
+          48,
+          16
+        ]
+      },
+      {
+        "sizes": [
+          589824,
+          2359296,
+          18874368
+        ],
+        "bytes": 21823488,
+        "nodes": 20,
+        "sample": "/model/layers.15/mlp/gate_up_proj/MatMul_Quant",
+        "dims": [
+          24576,
+          48,
+          16
+        ]
+      },
+      {
+        "sizes": [
+          294912,
+          1179648,
+          9437184
+        ],
+        "bytes": 10911744,
+        "nodes": 35,
+        "sample": "/model/layers.0/mlp/gate_up_proj/MatMul_Quant",
+        "dims": [
+          12288,
+          48,
+          16
+        ]
+      },
+      {
+        "sizes": [
+          215040,
+          860160,
+          6881280
+        ],
+        "bytes": 7956480,
+        "nodes": 1,
+        "sample": "/model/per_layer_projection/MatMul_Quant",
+        "dims": [
+          8960,
+          48,
+          16
+        ]
+      },
+      {
+        "sizes": [
+          147456,
+          589824,
+          4718592
+        ],
+        "bytes": 5455872,
+        "nodes": 15,
+        "sample": "/model/layers.0/mlp/down_proj/MatMul_Quant",
+        "dims": [
+          1536,
+          192,
+          16
+        ]
+      },
+      {
+        "sizes": [
+          98304,
+          393216,
+          3145728
+        ],
+        "bytes": 3637248,
+        "nodes": 14,
+        "sample": "/model/layers.4/attn/q_proj/MatMul_Quant",
+        "dims": [
+          4096,
+          48,
+          16
+        ]
+      },
+      {
+        "sizes": [
+          49152,
+          196608,
+          1572864
+        ],
+        "bytes": 1818624,
+        "nodes": 56,
+        "sample": "/model/layers.0/attn/q_proj/MatMul_Quant",
+        "dims": [
+          2048,
+          48,
+          16
+        ]
+      },
+      {
+        "sizes": [
+          12288,
+          49152,
+          393216
+        ],
+        "bytes": 454656,
+        "nodes": 6,
+        "sample": "/model/layers.4/attn/k_proj/MatMul_Quant",
+        "dims": [
+          512,
+          48,
+          16
+        ]
+      },
+      {
+        "sizes": [
+          6144,
+          24576,
+          196608
+        ],
+        "bytes": 227328,
+        "nodes": 94,
+        "sample": "/model/layers.0/attn/k_proj/MatMul_Quant",
+        "dims": [
+          256,
+          48,
+          16
+        ]
+      }
+    ]
+  }
 }

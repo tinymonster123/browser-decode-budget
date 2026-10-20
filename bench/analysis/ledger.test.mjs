@@ -22,6 +22,7 @@ import {
   lmHeadUtilization,
   combinePlateaus,
   attributeOps,
+  attributeMatmuls,
 } from './ledger.mjs';
 
 function row(mode, count, wallMs, gpuMs = wallMs) {
@@ -663,4 +664,70 @@ test('attributeOps: a shader hash is an identity but not a named op', () => {
 
   assert.equal(out.identityCoverage, 0.5);
   assert.equal(out.unlabeledShare, 0.25);
+});
+
+test('attributeMatmuls: groups matmul time by the weight fingerprint it binds', () => {
+  const profile = {
+    runs: [
+      {
+        step: 0,
+        segments: [
+          { us: 10000, dispatches: 1, pipelines: ['op:MatMulNBits'], buffers: [1e9, 4096] },
+          { us: 2000, dispatches: 1, pipelines: ['op:MatMulNBits'], buffers: [2e6, 4096] },
+          { us: 500, dispatches: 1, pipelines: ['op:MatMulNBits'], buffers: [123, 4096] },
+          { us: 700, dispatches: 1, pipelines: ['op:MatMulNBits'], buffers: [1000, 500, 4096] },
+          { us: Number.NaN, dispatches: 1, pipelines: ['op:MatMulNBits'], buffers: [1e9] },
+          { us: 900, dispatches: 1, pipelines: ['op:LayerNorm'], buffers: [1e9] },
+        ],
+      },
+    ],
+  };
+  const fingerprints = [
+    { sizes: [1e9], bytes: 1e9, nodes: 1 },
+    { sizes: [2e6], bytes: 2e6, nodes: 1 },
+    { sizes: [500, 1000], bytes: 1500, nodes: 2 },
+  ];
+
+  const out = attributeMatmuls(profile, { fingerprints });
+  const byBytes = Object.fromEntries(out.classes.map((row) => [row.bytes, row]));
+
+  assert.equal(out.dispatchesPerStep, 4);
+  assert.equal(out.matchedDispatchesPerStep, 3);
+  assert.equal(out.totalUsPerStep, 13200);
+  assert.ok(Math.abs(out.coverage - 12700 / 13200) < 1e-9);
+  assert.equal(byBytes[1e9].gbps, 100);
+  assert.equal(byBytes[2e6].gbps, 1);
+  assert.equal(out.unmatchedSegments, 1);
+  assert.equal(out.ambiguousSegments, 0);
+  assert.equal(out.invalidSegments, 1);
+});
+
+test('attributeMatmuls: two matching fingerprints with different bytes is ambiguous', () => {
+  const profile = {
+    runs: [
+      {
+        step: 0,
+        segments: [
+          { us: 10, dispatches: 1, pipelines: ['op:MatMulNBits'], buffers: [1e9, 2e6] },
+        ],
+      },
+    ],
+  };
+  const fingerprints = [
+    { sizes: [1e9], bytes: 1e9, nodes: 1 },
+    { sizes: [2e6], bytes: 2e6, nodes: 1 },
+  ];
+
+  const out = attributeMatmuls(profile, { fingerprints });
+
+  assert.equal(out.coverage, 0);
+  assert.equal(out.ambiguousSegments, 1);
+  assert.deepEqual(out.classes, []);
+});
+
+test('attributeMatmuls: refuses a profile without known fingerprints', () => {
+  const profile = { runs: [{ step: 0, segments: [] }] };
+
+  assert.throws(() => attributeMatmuls(profile, { fingerprints: [] }), /no known weight fingerprints/);
+  assert.throws(() => attributeMatmuls({ runs: [] }, { fingerprints: [{ sizes: [1], bytes: 1 }] }), /no usable decode steps/);
 });

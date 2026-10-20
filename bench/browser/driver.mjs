@@ -92,6 +92,27 @@ export function quantile(values, fraction) {
   return sorted[index];
 }
 
+// The timestamp pages share one failure shape: a patch must have taken, every
+// step must have coverage, and no encoder may overflow its query slots.
+export function timelineFailures(result) {
+  const failures = [];
+  if (result.error) failures.push(result.error);
+  for (const [name, ok] of Object.entries(result.patchInfo ?? {})) {
+    if (!ok) failures.push(`${name} patch failed`);
+  }
+  const runs = result.runs ?? [];
+  if (!runs.length) failures.push('no decode steps');
+  for (const run of runs) {
+    if (!(run.coverage > 0)) {
+      failures.push(`step ${run.step}: no timestamp coverage`);
+    }
+    if (run.overflowEncoders > 0) {
+      failures.push(`step ${run.step}: encoder overflow`);
+    }
+  }
+  return failures;
+}
+
 function printChecks(checks) {
   if (!checks.length) return;
   console.log('\nself-checks');

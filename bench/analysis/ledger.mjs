@@ -551,3 +551,114 @@ function labelOf(key) {
   if (key.startsWith('shader:')) return key.split(':')[1] ?? key;
   return key;
 }
+
+// Gate 8: how effective bandwidth varies with the bytes one dispatch reads.
+//
+// A split-pass segment carries the sizes of the storage buffers its bind
+// groups referenced. A size that exactly matches one known weight initializer
+// identifies the weight; zero or several matches stay unattributed, because a
+// guess would defeat the point of the measurement.
+export function attributeMatmuls(
+  profile,
+  { opKey = 'op:MatMulNBits', fingerprints = [] } = {},
+) {
+  const runs = profile?.runs ?? [];
+  if (!runs.length) throw new Error('attributeMatmuls: no usable decode steps');
+
+  const known = fingerprints.filter(
+    (entry) => Array.isArray(entry?.sizes) && entry.sizes.length > 0,
+  );
+  if (!known.length) throw new Error('attributeMatmuls: no known weight fingerprints');
+
+  const stepCount = runs.length;
+  const classes = new Map();
+  let totalUs = 0;
+  let matchedUs = 0;
+  let dispatches = 0;
+  let matchedDispatches = 0;
+  let unmatchedSegments = 0;
+  let ambiguousSegments = 0;
+  let invalidSegments = 0;
+
+  const containsAll = (buffers, sizes) => {
+    const counts = new Map();
+    for (const size of buffers) counts.set(size, (counts.get(size) ?? 0) + 1);
+    for (const size of sizes) {
+      const left = (counts.get(size) ?? 0) - 1;
+      if (left < 0) return false;
+      counts.set(size, left);
+    }
+    return true;
+  };
+
+  for (const run of runs) {
+    for (const segment of run.segments ?? []) {
+      const keys = (segment.pipelines ?? []).filter(Boolean);
+      if (!keys.includes(opKey)) continue;
+      const us = Number(segment.us);
+      if (!Number.isFinite(us) || us < 0) {
+        invalidSegments += 1;
+        continue;
+      }
+
+      const count = segment.dispatches ?? 1;
+      totalUs += us;
+      dispatches += count;
+
+      if (keys.length > 1) {
+        ambiguousSegments += 1;
+        continue;
+      }
+
+      const buffers = segment.buffers ?? [];
+      const matches = known.filter((entry) => containsAll(buffers, entry.sizes));
+      const byteOptions = [...new Set(matches.map((entry) => entry.bytes))];
+      if (byteOptions.length === 0) {
+        unmatchedSegments += 1;
+        continue;
+      }
+      if (byteOptions.length > 1) {
+        ambiguousSegments += 1;
+        continue;
+      }
+
+      const bytes = byteOptions[0];
+      const entry = classes.get(bytes) ?? { bytes, us: 0, dispatches: 0 };
+      entry.us += us;
+      entry.dispatches += count;
+      classes.set(bytes, entry);
+      matchedUs += us;
+      matchedDispatches += count;
+    }
+  }
+
+  const rows = [...classes.values()]
+    .map((entry) => {
+      const usPerStep = entry.us / stepCount;
+      const dispatchesPerStep = entry.dispatches / stepCount;
+      return {
+        bytes: entry.bytes,
+        dispatchesPerStep,
+        usPerStep,
+        gbps:
+          usPerStep > 0
+            ? (entry.bytes * dispatchesPerStep) / (usPerStep * 1000)
+            : null,
+        shareOfMatmul: totalUs ? entry.us / totalUs : null,
+      };
+    })
+    .sort((a, b) => b.usPerStep - a.usPerStep);
+
+  return {
+    opKey,
+    classes: rows,
+    totalUsPerStep: totalUs / stepCount,
+    matchedUsPerStep: matchedUs / stepCount,
+    dispatchesPerStep: dispatches / stepCount,
+    matchedDispatchesPerStep: matchedDispatches / stepCount,
+    coverage: totalUs ? matchedUs / totalUs : null,
+    unmatchedSegments,
+    ambiguousSegments,
+    invalidSegments,
+  };
+}

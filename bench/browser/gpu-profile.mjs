@@ -14,6 +14,7 @@ import {
   mean,
   quantile,
   runDriver,
+  timelineFailures,
 } from './driver.mjs';
 
 const MODELS = envList('MODELS', ['base', 'gate1', 'gate2']);
@@ -72,25 +73,13 @@ await runDriver({
   // coverage, and no encoder may have overflowed its query slots.
   checks({ results }) {
     return results.map((result) => {
-      const failures = [];
-      if (result.error) failures.push(result.error);
-      for (const [name, ok] of Object.entries(result.patchInfo ?? {})) {
-        if (!ok) failures.push(`${name} patch failed`);
-      }
-      const runs = result.runs ?? [];
-      if (!runs.length) failures.push('no decode steps');
-      for (const run of runs) {
-        if (!(run.coverage > 0)) {
-          failures.push(`step ${run.step}: no timestamp coverage`);
-        }
-        if (run.overflowEncoders > 0) {
-          failures.push(`step ${run.step}: encoder overflow`);
-        }
-      }
+      const failures = timelineFailures(result);
       return {
         name: `${result.model}: timestamps`,
         ok: failures.length === 0,
-        detail: failures.join('; ') || `${runs.length} steps covered`,
+        detail:
+          failures.join('; ') ||
+          `${result.runs?.length ?? 0} steps covered`,
       };
     });
   },

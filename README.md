@@ -2,8 +2,10 @@
 
 浏览器里 LLM decode 的时间账。项目从「减少 WebGPU dispatch 能不能把 decode 压下来」
 这个问题开始；Gate 6 用实测负结果关闭了这条路线（tag `gate6-closed`）。
-Gate 7 把 27.2 ms 按 op class 拆开：**71–75% 是 q4 矩阵乘，其余 kernel 25–29%**；
-下一个候选问题是 matmul 的带宽效率（推论，不是已选路线），而不是继续做图手术。
+Gate 7 把 27.2 ms 按 op class 拆开：**71–75% 是 q4 矩阵乘，其余 kernel 25–29%**。
+Gate 8 再按权重字节拆：**带宽随权重变小而下降**，0.22 MiB 的 k_proj 只有
+10.7–15.2 GB/s，把 matmul 的平均值拉到 62 GB/s。现在的问题是小 kernel 的
+并行度，而不是图结构。
 
 从 `gemma-translate` 的 decode 实验中抽出。那边看到的是 29.9 ms/token；本项目
 先证伪了「瓶颈在每算子 dispatch」这个假设，再转向成本归因。
@@ -20,6 +22,7 @@ Gate 7 把 27.2 ms 按 op class 拆开：**71–75% 是 q4 矩阵乘，其余 ke
 | **5** | 27 ms 到底花在哪？ | ✅ 2026-10-19 | 最贵的 1 个 pass 占 13%；LM head 2.6 ms 只发 1 次 dispatch |
 | **6** | 还有没有 ≥10% 的路线？ | ❌ 2026-10-20 | **三条路线全关，无 frontier ticket**；见 `gate6-closed` |
 | **7** | 27 ms 按 op class 怎么分？ | ✅ 2026-10-20 | **MatMulNBits 71–75%**；其余所有 kernel 合计 25–29% |
+| **8** | 242 次 matmul 效率为什么不同？ | ✅ 2026-10-20 | 带宽随权重字节下降：0.22 MiB 的 k_proj 只有 **10.7–15.2 GB/s** |
 
 Gate 0 的完整报告见 [`docs/experiments/2026-10-19-gate0-census.md`](docs/experiments/2026-10-19-gate0-census.md)，
 Gate 1 见 [`docs/experiments/2026-10-19-gate1-manual-fusion.md`](docs/experiments/2026-10-19-gate1-manual-fusion.md)，
@@ -250,6 +253,30 @@ MatMulNBits 的 726 个权重张量共 1.3178 GB，读取用了 18.10 / 17.76 ms
 **是 matmul 自己没跑满带宽**。详见
 [`docs/experiments/2026-10-20-gate7-op-attribution.md`](docs/experiments/2026-10-20-gate7-op-attribution.md)。
 
+## Gate 8 结果：小 matmul 的效率
+
+每个 dispatch 记录它绑定的 buffer 大小；对每个 MatMulNBits 节点，
+把消费的 initializer 字节排成指纹（242 个节点只有 9 种）。一个 dispatch 的
+buffer 多重集包含哪个指纹，就归到哪个权重档位。
+
+| 权重 MiB | 节点 | dispatch/step | GB/s（run1 / run2） |
+|---:|---|---:|---:|
+| 20.81 | gate_up（20 层） | 20 | 72.1 / 66.3 |
+| 10.41 | gate_up（35 层） | 35 | 72.7 / 66.9 |
+| 222.00 | LM head | 1 | 66.4 / 71.1 |
+| 1.73 | q_proj | 56 | 47.5 / 47.1 |
+| **0.22** | **k_proj** | **94** | **10.7 / 15.2** |
+| 5.20 | down_proj | 15 | 63.3 / 64.0 |
+| 3.47 | q_proj | 14 | 64.6 / 58.8 |
+| 7.59 | per-layer projection | 1 | 69.3 / 55.9 |
+| 0.43 | k_proj | 6 | 24.8 / 31.3 |
+
+**带宽随权重字节数下降。** 94 次 0.22 MiB 的 k_proj 占 matmul 时间
+6.5–9.4%，只有 10.7–15.2 GB/s；和最大档位（55.9–72.7）差 3.7–6.8 倍。
+两个小档位合计 150/242 次 dispatch；如果都达到 66 GB/s，可省约
+**1.70–2.27 ms（token 的 6.3–8.4%）**——推论，不是已选路线。
+详见 [`docs/experiments/2026-10-20-gate8-matmul-efficiency.md`](docs/experiments/2026-10-20-gate8-matmul-efficiency.md)。
+
 ## 目录
 
 ```text
@@ -287,6 +314,7 @@ make gate2-check           # Gate1→Gate2 + 原始→Gate2 等价性检查
 make bench-prepare         # 准备浏览器 runtime 资产
 make bench                 # Chrome + WebGPU：默认 base vs gate2
 make bench-op-attribution  # Gate 7：一 dispatch 一 pass，按 op class 归因
+make bench-matmul-efficiency  # Gate 8：按权重字节看 matmul 的有效带宽
 ```
 
 默认读取 `~/Projects/gemma-browser-lab/models/onnx-community/gemma-4-E2B-it-ONNX`。
@@ -339,6 +367,9 @@ models/derived/<artifact-id>/
 - **Gate 7 — op 归因（已完成）**：一 dispatch 一 pass + shader module label，
   得到 MatMulNBits 71–75%、其余 25–29% 的账。下一个问题变成「为什么 matmul
   只跑到带宽上限的 67–68%」，而不是「另外 13 ms 花在哪」。
+- **Gate 8 — matmul 效率（已完成）**：按权重指纹归因，带宽随权重字节数下降；
+  94 次 0.22 MiB k_proj 只有 10.7–15.2 GB/s。下一步的问题是「小 matmul 是不是
+  并行度受限」，而不是「总体带宽不够」。
 
 ## 非目标
 

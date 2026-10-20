@@ -98,10 +98,56 @@ def group_by_op(graph: onnx.GraphProto) -> dict:
     }
 
 
+def tensor_fingerprints_for_op(graph: onnx.GraphProto, op_type: str) -> list[dict]:
+    """Distinct initializer-size fingerprints for one op type.
+
+    A node like MatMulNBits binds several initializers (packed weight, scales,
+    zero points). Their sorted sizes are the fingerprint; nodes with the same
+    fingerprint read the same number of bytes.
+    """
+    sizes = {}
+    dims = {}
+    for tensor in graph.initializer:
+        sizes[tensor.name] = tensor_bytes(tensor)
+        dims[tensor.name] = list(tensor.dims)
+
+    fingerprints: dict[tuple[int, ...], dict] = {}
+    for node in graph.node:
+        if node.op_type != op_type:
+            continue
+        names = [name for name in set(node.input) if name in sizes]
+        if not names:
+            continue
+        values = sorted(sizes[name] for name in names)
+        key = tuple(values)
+        entry = fingerprints.get(key)
+        if entry is None:
+            # The packed weight is the largest initializer whose name says
+            # "weight"; equal-sized scale tensors would otherwise win the
+            # tie. Kept as an example, not as a per-node claim.
+            weight_names = [name for name in names if "weight" in name]
+            largest = max(weight_names or names, key=lambda name: sizes[name])
+            entry = {
+                "sizes": list(key),
+                "bytes": sum(key),
+                "nodes": 0,
+                "sample": node.name,
+                "dims": dims[largest],
+            }
+        entry["nodes"] += 1
+        fingerprints[key] = entry
+
+    return sorted(fingerprints.values(), key=lambda entry: -entry["bytes"])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--json", required=True)
+    parser.add_argument(
+        "--op",
+        help="also record the sorted per-tensor sizes for this op type",
+    )
     args = parser.parse_args()
 
     graph = onnx.load(args.model, load_external_data=False).graph
@@ -109,23 +155,35 @@ def main() -> int:
     payload = {
         "name": Path(args.model).stem,
         "model": str(Path(args.model).resolve()),
-        "totalInitializerBytes": total,
-        "initializers": len(sizes),
-        "sharedInitializers": len(shared),
-        "sharedBytes": sum(sizes[name] for name in shared),
-        "rows": rows,
+        **grouped,
     }
+
+    if args.op:
+        payload["fingerprints"] = {
+            "opType": args.op,
+            "entries": tensor_fingerprints_for_op(graph, args.op),
+        }
 
     out = Path(args.json)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2) + "\n")
 
-    print(f"total initializer bytes: {total:,} ({len(sizes)} tensors)")
-    print(f"shared tensors: {len(shared)} ({payload['sharedBytes']:,} bytes)")
-    for row in rows:
+    print(
+        f"total initializer bytes: {grouped['totalInitializerBytes']:,} "
+        f"({grouped['initializers']} tensors)"
+    )
+    print(
+        f"shared tensors: {grouped['sharedInitializers']} "
+        f"({grouped['sharedBytes']:,} bytes)"
+    )
+    for row in grouped["rows"]:
         print(
             f"{row['opType']:32s} {row['bytes']:>14,} "
             f"{100 * row['share']:5.1f}%  {row['initializers']} tensors"
+        )
+    if args.op:
+        print(
+            f"{args.op}: {len(payload['fingerprints']['entries'])} fingerprints"
         )
     print(f"\nwrote {out}")
     return 0

@@ -15,7 +15,7 @@ from onnx import TensorProto, helper
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from weight_bytes_by_op import group_by_op  # noqa: E402
+from weight_bytes_by_op import group_by_op, tensor_fingerprints_for_op  # noqa: E402
 
 
 def raw_initializer(name, dims, dtype, width):
@@ -34,8 +34,8 @@ def build_fixture() -> onnx.ModelProto:
         raw_initializer("norm_weight", [4], TensorProto.FLOAT16, 2),
     ]
     nodes = [
-        helper.make_node("MatMul", ["shared_weight", "x"], ["y0"]),
-        helper.make_node("MatMul", ["x", "shared_weight"], ["y1"]),
+        helper.make_node("MatMul", ["shared_weight", "x"], ["y0"], name="matmul_a"),
+        helper.make_node("MatMul", ["x", "shared_weight"], ["y1"], name="matmul_b"),
         helper.make_node("RotaryEmbedding", ["cos_cache", "x"], ["y2"]),
         helper.make_node("RotaryEmbedding", ["cos_cache", "x"], ["y3"]),
         helper.make_node("SimplifiedLayerNormalization", ["x", "norm_weight"], ["y4"]),
@@ -70,6 +70,19 @@ class WeightBytesByOpTest(unittest.TestCase):
         self.assertEqual(grouped["initializers"], 3)
         self.assertEqual(grouped["sharedInitializers"], 2)
         self.assertEqual(grouped["sharedBytes"], 64)
+
+    def test_fingerprints_group_nodes_with_the_same_initializer_sizes(self) -> None:
+        graph = build_fixture().graph
+
+        entries = tensor_fingerprints_for_op(graph, "MatMul")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["sizes"], [32])
+        self.assertEqual(entries[0]["bytes"], 32)
+        self.assertEqual(entries[0]["nodes"], 2)
+        self.assertEqual(entries[0]["dims"], [4, 4])
+        self.assertEqual(entries[0]["sample"], "matmul_a")
+
+        self.assertEqual(tensor_fingerprints_for_op(graph, "Missing"), [])
 
     def test_rows_are_sorted_by_bytes(self) -> None:
         grouped = group_by_op(build_fixture().graph)

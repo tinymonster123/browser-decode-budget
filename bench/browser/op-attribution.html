@@ -56,6 +56,7 @@
         device: false,
         shader: false,
         pipeline: false,
+        bindGroup: false,
         featureInjected: false,
       };
 
@@ -64,6 +65,7 @@
       const modules = new WeakMap(); // GPUShaderModule -> { label, hash, codeLength }
       const pipelines = new WeakMap(); // GPUComputePipeline -> { label, module, key }
       const identityDetails = new Map(); // key -> what the descriptor revealed
+      const bindGroupSizes = new WeakMap(); // GPUBindGroup -> buffer sizes it binds
 
       let nextModuleId = 0;
       let nextPipelineId = 0;
@@ -133,11 +135,19 @@
           if (!inner) return;
           inner.end();
           if (slot != null && state.dispatches > 0) {
+            // Flatten the sizes of the bind groups bound at this moment. The
+            // Map replaces an index on rebind, so a replayed group is not
+            // counted twice, while distinct groups keep their multiplicity.
+            const buffers = [];
+            for (const { group } of state.bindGroups.values()) {
+              buffers.push(...(bindGroupSizes.get(group) ?? []));
+            }
             rec.passes.push({
               seq: passSeq++,
               slot,
               dispatches: state.dispatches,
               pipelines: [...new Set(state.pipelines)],
+              buffers,
             });
           }
           inner = null;
@@ -199,6 +209,23 @@
           ) || patchInfo.device;
 
         // --- creation-time identity ------------------------------------
+        // Gate 8 needs the weight bytes a dispatch reads. ORT binds them as
+        // storage buffers, so the bind group is where the size is visible.
+        patchInfo.bindGroup =
+          wrapMethod(protos.device, 'createBindGroup', (orig) =>
+            function (desc) {
+              const group = orig.call(this, desc);
+              const sizes = [];
+              for (const entry of desc?.entries ?? []) {
+                const resource = entry?.resource;
+                const buffer = resource?.buffer;
+                if (buffer) sizes.push(resource.size ?? buffer.size);
+              }
+              bindGroupSizes.set(group, sizes);
+              return group;
+            },
+          ) || patchInfo.bindGroup;
+
         patchInfo.shader =
           wrapMethod(protos.device, 'createShaderModule', (orig) =>
             function (desc) {
@@ -340,6 +367,7 @@
             us: Number(segment.us.toFixed(3)),
             dispatches: segment.dispatches,
             pipelines: segment.pipelines,
+            buffers: segment.buffers,
           })),
         };
       }

@@ -18,6 +18,7 @@ import {
   quantile,
   root,
   runDriver,
+  timelineFailures,
 } from './driver.mjs';
 
 function withEnv(values, fn) {
@@ -137,4 +138,25 @@ test('runDriver: a failed check fails the run after writing the ledger', async (
     process.exitCode = savedExitCode;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('timelineFailures: patch, coverage and overflow all fail the run', () => {
+  assert.deepEqual(
+    timelineFailures({
+      patchInfo: { pass: true },
+      runs: [{ step: 0, coverage: 1, overflowEncoders: 0 }],
+    }),
+    [],
+  );
+
+  const failures = timelineFailures({
+    error: 'boom',
+    patchInfo: { pass: false },
+    runs: [{ step: 2, coverage: 0, overflowEncoders: 1 }],
+  });
+
+  assert.equal(failures.length, 4);
+  assert.ok(failures.includes('pass patch failed'));
+  assert.ok(failures.includes('step 2: no timestamp coverage'));
+  assert.ok(failures.includes('step 2: encoder overflow'));
 });

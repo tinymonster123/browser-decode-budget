@@ -8,7 +8,8 @@ GATE1 ?= models/derived/gemma4-e2b-q4f16-gate1/onnx/decoder_model_merged_q4f16.o
 GATE2 ?= models/derived/gemma4-e2b-q4f16-gate2/onnx/decoder_model_merged_q4f16.onnx
 
 .PHONY: test test-js census cost gate0 gate1 gate1-check gate2 gate2-check bench-prepare bench \
-	bench-op-attribution bench-bandwidth lm-head-weights lm-head-utilization weight-bytes
+	bench-op-attribution bench-matmul-efficiency bench-bandwidth \
+	lm-head-weights lm-head-utilization weight-bytes
 
 test:
 	$(PY) -m unittest discover -s tools/tests -v
@@ -86,6 +87,10 @@ bench-bandwidth: bench-prepare
 bench-op-attribution: bench-prepare
 	node bench/browser/op-attribution.mjs
 
+# Gate 8: effective bandwidth per MatMulNBits weight size.
+bench-matmul-efficiency: bench-prepare
+	node bench/browser/matmul-efficiency.mjs
+
 # Gate 6: LM head weight bytes (recorded once), then utilization from ledgers.
 lm-head-weights:
 	$(PY) tools/lm_head_weights.py --name base --model "$(DECODER)" \
@@ -101,7 +106,7 @@ lm-head-utilization:
 # Gate 7: initializer bytes grouped by the op that consumes them.
 weight-bytes:
 	$(PY) tools/weight_bytes_by_op.py --model "$(DECODER)" \
-		--json runs/2026-10-20-exp7-weight-bytes-by-op.json
+		--op MatMulNBits --json runs/2026-10-20-exp7-weight-bytes-by-op.json
 
 # Gate 4 follow-up: what the cpu-timed pass costs, reconciled against exp 2.
 bench-perf-now:
